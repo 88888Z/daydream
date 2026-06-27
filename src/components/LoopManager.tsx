@@ -132,10 +132,18 @@ export default function LoopManager() {
       if (e.code === "Delete" || e.code === "Backspace") {
         if (selectedIds.length > 0) deleteSelected();
       }
+      if (e.ctrlKey && e.code === "KeyA") {
+        e.preventDefault();
+        selectAll();
+      }
+      if (e.shiftKey && e.code === "Delete") {
+        e.preventDefault();
+        if (selectedIds.length > 0) deleteSelected();
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [isPlaying, videos.length, play, stop, selectedIds, deleteSelected, clearSelection]);
+  }, [isPlaying, videos.length, play, stop, selectedIds, deleteSelected, clearSelection, selectAll]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
