@@ -60,6 +60,7 @@ impl MpvPlayer {
     fn spawn_mpv(
         &self,
         expanded_paths: &[String],
+        rotate_to_entry: Option<usize>,
     ) -> Result<(Child, PathBuf), PlayerError> {
         let socket_path = PathBuf::from(MPV_SOCKET);
         let _ = std::fs::remove_file(&socket_path);
@@ -75,21 +76,27 @@ impl MpvPlayer {
             }
         }
 
-        let mut args: Vec<&str> = vec![
-            "--input-ipc-server=/tmp/daydream-mpv.sock",
-            "--fullscreen",
-            "--no-border",
-            "--vo=gpu-next",
-            "--keep-open=yes",
-            "--loop-playlist=inf",
+        let mut args: Vec<String> = vec![
+            "--input-ipc-server=/tmp/daydream-mpv.sock".into(),
+            "--fullscreen".into(),
+            "--no-border".into(),
+            "--vo=gpu-next".into(),
+            "--keep-open=yes".into(),
+            "--loop-playlist=inf".into(),
         ];
-        for p in expanded_paths.iter() {
-            args.push(p.as_str());
+        if let Some(entry) = rotate_to_entry {
+            eprintln!("[daydream] --playlist-start={entry}");
+            args.push(format!("--playlist-start={entry}"));
         }
+        for p in expanded_paths.iter() {
+            args.push(p.clone());
+        }
+
+        let args_refs: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
 
         let child = Command::new("mpv")
             .env("WAYLAND_DISPLAY", std::env::var("WAYLAND_DISPLAY").unwrap_or_default())
-            .args(&args)
+            .args(&args_refs)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -135,6 +142,7 @@ impl MpvPlayer {
                                     if let Some(entry_id) = obj.get("playlist_entry_id").and_then(|e| e.as_u64()) {
                                         let idx = (entry_id as usize).saturating_sub(1);
                                         if let Some(&item_idx) = entry_to_item.get(idx) {
+                                            crate::LAST_PLAYED_ENTRY_MS.store(idx as i64, std::sync::atomic::Ordering::SeqCst);
                                             let _ = app.emit("now-playing", serde_json::json!({
                                                 "itemIndex": item_idx,
                                                 "entryIndex": idx,
@@ -156,6 +164,7 @@ impl MpvPlayer {
         &self,
         items: &[config::VideoItem],
         global: &config::VideoParams,
+        rotate_to: Option<usize>,
         app: tauri::AppHandle,
     ) -> Result<(), PlayerError> {
         if items.is_empty() {
@@ -169,7 +178,14 @@ impl MpvPlayer {
         let (expanded_paths, entry_to_item) = Self::build_expanded_paths(items, global);
         let total_items = expanded_paths.len();
 
-        let (child, socket_path) = self.spawn_mpv(&expanded_paths)?;
+        let rotate_to_entry = rotate_to
+            .and_then(|item_idx| {
+                let pos = entry_to_item.iter().position(|&i| i == item_idx);
+                eprintln!("[daydream] rotate_to item={item_idx} entry_to_item={entry_to_item:?} -> entry={pos:?}");
+                pos
+            });
+
+        let (child, socket_path) = self.spawn_mpv(&expanded_paths, rotate_to_entry)?;
 
         let stop_signal = Arc::new(AtomicBool::new(false));
         *self.stop_signal.lock().unwrap() = Some(stop_signal.clone());
@@ -201,10 +217,12 @@ impl MpvPlayer {
         // Small extra wait for reader to be ready for events
         std::thread::sleep(Duration::from_millis(200));
 
-        // Send baseline now-playing (item 0) in case first event was already fired
+        // Send baseline now-playing with correct item/entry
+        let baseline_item = rotate_to.unwrap_or(0);
+        let baseline_entry = rotate_to_entry.unwrap_or(0);
         let _ = app.emit("now-playing", serde_json::json!({
-            "itemIndex": 0usize,
-            "entryIndex": 0usize,
+            "itemIndex": baseline_item,
+            "entryIndex": baseline_entry,
             "totalEntries": total_items,
         }));
 

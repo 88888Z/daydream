@@ -54,6 +54,7 @@ pub struct GlobalSettings {
     pub idle_enabled: bool,
     pub autoplay_on_idle: bool,
     pub start_on_boot: bool,
+    pub last_played_entry: Option<usize>,
 }
 
 impl Default for GlobalSettings {
@@ -64,6 +65,7 @@ impl Default for GlobalSettings {
             idle_enabled: false,
             autoplay_on_idle: true,
             start_on_boot: false,
+            last_played_entry: None,
         }
     }
 }

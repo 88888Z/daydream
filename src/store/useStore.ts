@@ -48,6 +48,7 @@ export const useStore = create<AppState>((set, get) => ({
       idle_enabled: false,
       autoplay_on_idle: true,
       start_on_boot: false,
+      last_played_entry: null,
     },
     videos: [],
   },
@@ -145,7 +146,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   play: async () => {
     try {
-      await invoke("manual_play");
+      const selectedIds = get().selectedIds;
+      await invoke("manual_play", { selectedIds });
       set({ isPlaying: true });
     } catch (e) {
       console.error("Failed to start playback", e);

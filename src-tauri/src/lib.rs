@@ -5,7 +5,7 @@ mod thumbnail;
 
 use config::ConfigState;
 use player::MpvPlayer;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tauri::{
     AppHandle, Emitter, Manager,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -14,6 +14,7 @@ use tauri::{
 
 static IDLE_MONITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static IS_PLAYING: AtomicBool = AtomicBool::new(false);
+pub static LAST_PLAYED_ENTRY_MS: AtomicI64 = AtomicI64::new(-1);
 
 #[tauri::command]
 fn start_idle_monitor(app: AppHandle) {
@@ -40,18 +41,33 @@ fn is_playing() -> bool {
 }
 
 #[tauri::command]
-fn manual_play(app: AppHandle, state: tauri::State<ConfigState>) -> Result<(), String> {
+fn manual_play(app: AppHandle, state: tauri::State<ConfigState>,
+    selected_ids: Vec<String>) -> Result<(), String> {
     let config = state.config.lock().unwrap();
     let videos = config.videos.clone();
     let global = config.global.default_params.clone();
+    let last_played = config.global.last_played_entry;
     drop(config);
 
     if videos.is_empty() {
         return Err("No videos in loop".into());
     }
 
+    let rotate_to = if selected_ids.is_empty() {
+        eprintln!("[daydream] play: no selection, resume from last_played={:?}", last_played);
+        last_played
+    } else {
+        let found: Vec<usize> = videos.iter()
+            .enumerate()
+            .filter(|(_, v)| selected_ids.contains(&v.id))
+            .map(|(i, _)| i)
+            .collect();
+        eprintln!("[daydream] play: selected_ids={:?} found item_indices={:?}", selected_ids, found);
+        found.into_iter().min()
+    };
+
     IS_PLAYING.store(true, Ordering::SeqCst);
-    start_playback(&app, &videos, &global).map_err(|e| e.to_string())?;
+    start_playback(&app, &videos, &global, rotate_to).map_err(|e| e.to_string())?;
     let _ = app.emit("playback-started", ());
     Ok(())
 }
@@ -122,7 +138,7 @@ fn idle_monitor_loop(app: AppHandle) {
                         eprintln!("[daydream-idle] starting idle playback");
                         IS_PLAYING.store(true, Ordering::SeqCst);
                         let _ = app.emit("playback-started", ());
-                        if let Err(e) = start_playback(&app, &videos, &global_params) {
+                        if let Err(e) = start_playback(&app, &videos, &global_params, None) {
                             eprintln!("[daydream-idle] playback failed: {e}");
                         }
                     }
@@ -142,12 +158,21 @@ fn idle_monitor_loop(app: AppHandle) {
     }
 }
 
-fn start_playback(app: &AppHandle, videos: &[config::VideoItem], global: &config::VideoParams) -> Result<(), player::PlayerError> {
+fn start_playback(app: &AppHandle, videos: &[config::VideoItem], global: &config::VideoParams,
+    rotate_to: Option<usize>) -> Result<(), player::PlayerError> {
     let player = app.state::<MpvPlayer>();
-    player.start_with_monitor(videos, global, app.clone())
+    player.start_with_monitor(videos, global, rotate_to, app.clone())
 }
 
 fn stop_playback(app: &AppHandle) {
+    let entry = LAST_PLAYED_ENTRY_MS.load(Ordering::SeqCst);
+    eprintln!("[daydream] stop_playback: last_played_entry={}", entry);
+    if entry >= 0 {
+        let state = app.state::<ConfigState>();
+        let mut config = state.config.lock().unwrap();
+        config.global.last_played_entry = Some(entry as usize);
+        let _ = state.save(&config);
+    }
     let player = app.state::<MpvPlayer>();
     player.stop();
 }
