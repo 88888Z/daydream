@@ -129,14 +129,14 @@ export default function LoopManager() {
       if (e.code === "Escape") {
         clearSelection();
       }
-      if (e.code === "Delete" || e.code === "Backspace") {
+      if (e.code === "Delete" || e.code === "Backspace" || e.code === "NumpadDecimal") {
         if (selectedIds.length > 0) deleteSelected();
       }
       if (e.ctrlKey && e.code === "KeyA") {
         e.preventDefault();
         selectAll();
       }
-      if (e.shiftKey && e.code === "Delete") {
+      if (e.shiftKey && (e.code === "Delete" || e.code === "NumpadDecimal")) {
         e.preventDefault();
         if (selectedIds.length > 0) deleteSelected();
       }
