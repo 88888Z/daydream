@@ -75,8 +75,8 @@ cargo tauri build
 |---|---|
 | `Space` | Play / Stop |
 | `Escape` | Clear selection |
-| `Delete` / `Backspace` | Delete selected |
-| `Shift + Delete` | Delete selected |
+| `Delete` / `Backspace` / `Del` (numpad) | Delete selected |
+| `Shift + Delete` / `Shift + Del` (numpad) | Delete selected |
 | `Ctrl + A` | Select all |
 | `Shift + click` | Toggle selection |
 
