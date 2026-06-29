@@ -125,6 +125,7 @@ impl MpvPlayer {
 
             // Retry connect up to 10× (1s total)
             let mut stream = None;
+            let mut retries = 0u32;
             for _ in 0..10 {
                 if stop_signal.load(Ordering::SeqCst) {
                     return;
@@ -133,8 +134,10 @@ impl MpvPlayer {
                     stream = Some(s);
                     break;
                 }
+                retries += 1;
                 std::thread::sleep(Duration::from_millis(100));
             }
+            eprintln!("[TIMING] reader_connect {} retries", retries);
 
             if let Some(stream) = stream {
                 let reader = BufReader::new(stream);
