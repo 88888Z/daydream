@@ -235,40 +235,25 @@ impl MpvPlayer {
             });
 
         let _spawn_t = std::time::Instant::now();
-        let (child, socket_path) = self.spawn_mpv(&expanded_paths, rotate_to_entry)?;
+        let (child, _) = self.spawn_mpv(&expanded_paths, rotate_to_entry)?;
         let spawn_us = _spawn_t.elapsed().as_micros();
 
         let stop_signal = Arc::new(AtomicBool::new(false));
         *self.stop_signal.lock().unwrap() = Some(stop_signal.clone());
         *self.child.lock().unwrap() = Some(child);
 
-        // Connect event reader as soon as socket appears (before IPC commands)
-        let _reader_t = std::time::Instant::now();
-        let mut reader_spawned = false;
-        for _ in 0..30 {
-            if socket_path.exists() {
-                if !reader_spawned {
-                    Self::connect_event_reader(
-                        stop_signal.clone(),
-                        entry_to_item.clone(),
-                        total_items,
-                        items.to_vec(),
-                        global.clone(),
-                        app.clone(),
-                    );
-                    reader_spawned = true;
-                }
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let reader_us = _reader_t.elapsed().as_micros();
-        if !reader_spawned {
-            self.stop();
-            return Err(PlayerError::SocketTimeout);
-        }
+        // Spawn event reader immediately — it retries socket connect internally
+        Self::connect_event_reader(
+            stop_signal.clone(),
+            entry_to_item.clone(),
+            total_items,
+            items.to_vec(),
+            global.clone(),
+            app.clone(),
+        );
 
-        // Send baseline now-playing with correct item/entry
+        // Fire-and-forget baseline now-playing and speed/volume
+        // If socket isn't ready yet, they silently fail — speed is re-set on first playback-restart
         let baseline_item = rotate_to.unwrap_or(0);
         let baseline_entry = rotate_to_entry.unwrap_or(0);
         let _ = app.emit("now-playing", serde_json::json!({
@@ -276,8 +261,6 @@ impl MpvPlayer {
             "entryIndex": baseline_entry,
             "totalEntries": total_items,
         }));
-
-        // Set speed/volume for first item
         if let Some(first) = items.first() {
             let params = first.local.as_ref().unwrap_or(global);
             let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "speed", params.speed]}));
@@ -321,8 +304,8 @@ impl MpvPlayer {
             }
         });
 
-        eprintln!("[TIMING] start_with_monitor {}us spawn={}us reader={}us stop={}us items={} expanded={}",
-            _t.elapsed().as_micros(), spawn_us, reader_us, stop_time, items.len(), expanded_paths.len());
+        eprintln!("[TIMING] start_with_monitor {}us spawn={}us stop={}us items={} expanded={}",
+            _t.elapsed().as_micros(), spawn_us, stop_time, items.len(), expanded_paths.len());
         Ok(())
     }
 

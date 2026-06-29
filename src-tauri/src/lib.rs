@@ -116,12 +116,7 @@ fn idle_monitor_loop(app: AppHandle) {
         }
 
         let idle_ms = match idle::IdleDetector::idle_ms() {
-            Ok(ms) => {
-                if ms > 150 {
-                    eprintln!("[TIMING] idle_detect {}ms", ms);
-                }
-                ms
-            },
+            Ok(ms) => ms,
             Err(e) => {
                 eprintln!("[idle] detect error: {e} — resetting");
                 previous_idle = None;
