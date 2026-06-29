@@ -90,6 +90,10 @@ fn idle_monitor_loop(app: AppHandle) {
     let mut near_zero_count: u64 = 0;
     let mut steady_seen: bool = false;
     let mut after_climb: bool = false;
+    let mut consec_detected: u64 = 0;
+    // Ring buffer of last 10 idle_ms values for jitter diagnosis
+    let mut hist: [u64; 10] = [0; 10];
+    let mut hist_pos: usize = 0;
 
     while IDLE_MONITOR_ACTIVE.load(Ordering::SeqCst) {
         let _tick_start = std::time::Instant::now();
@@ -112,6 +116,7 @@ fn idle_monitor_loop(app: AppHandle) {
             near_zero_count = 0;
             steady_seen = false;
             after_climb = false;
+            hist_pos = 0; consec_detected = 0;
             continue;
         }
 
@@ -124,9 +129,14 @@ fn idle_monitor_loop(app: AppHandle) {
                 near_zero_count = 0;
                 steady_seen = false;
                 after_climb = false;
+                hist_pos = 0; consec_detected = 0;
                 continue;
             }
         };
+
+        // Store in ring buffer
+        hist[hist_pos] = idle_ms;
+        hist_pos = (hist_pos + 1) % hist.len();
 
         let idle_secs = idle_ms / 1000;
         let prev = previous_idle;
@@ -147,22 +157,12 @@ fn idle_monitor_loop(app: AppHandle) {
         let remaining = timeout.saturating_sub(idle_secs.min(timeout));
         let _ = app.emit("idle-status", serde_json::json!({ "remaining": remaining }));
 
-        // PATH 0: strong signal — real user interaction (no mpv)
+        // PATH 0: interaction detected — dump history, then fall through to NZ counting
         if detected_interaction && !mpv_flag && is_playing {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let since_last_mpv = now_ms.saturating_sub(LAST_MPV_TRANSITION_MS.load(Ordering::SeqCst));
-            if since_last_mpv > 2000 {
-                eprintln!("[idle] REAL-STOP {}→{}ms dist={}ms", prev.unwrap_or(0), idle_ms, since_last_mpv);
-                near_zero_count = 0; after_climb = false;
-                IS_PLAYING.store(false, Ordering::SeqCst);
-                let _ = app.emit("playback-stopped", ());
-                stop_playback(&app);
-                previous_idle = Some(idle_ms);
-                continue;
-            }
+            consec_detected += 1;
+            let h: Vec<String> = hist.iter().enumerate().map(|(i, &v)| format!("{}:{}", i, v)).collect();
+            eprintln!("[idle] DETECT hist=[{}] prev={:?} curr={} consec={}", h.join(","), prev, idle_ms, consec_detected);
+            // Fall through to NZ counting — don't stop instantly, let NZ threshold handle it
         }
 
         // PATH 1: mpv transition
