@@ -45,6 +45,9 @@ export default function LoopManager() {
   const deleteSelected = useStore((s) => s.deleteSelected);
   const deleteAll = useStore((s) => s.deleteAll);
 
+  const idleTrace = useStore((s) => s.idleTrace);
+  const [showTelemetry, setShowTelemetry] = useState(false);
+
   const idleEnabled = config.global.idle_enabled;
   const scrollRef = useRef<HTMLDivElement>(null);
   const [rubber, setRubber] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
@@ -141,6 +144,10 @@ export default function LoopManager() {
       if (e.shiftKey && (e.code === "Delete" || e.code === "NumpadDecimal")) {
         e.preventDefault();
         if (selectedIds.length > 0) deleteSelected();
+      }
+      if (e.ctrlKey && e.shiftKey && e.code === "KeyT") {
+        e.preventDefault();
+        setShowTelemetry((s) => !s);
       }
     };
     window.addEventListener("keydown", handler);
@@ -338,6 +345,25 @@ export default function LoopManager() {
 
       <ItemEditor />
       {showGlobalSettings && <GlobalSettingsPanel />}
+      {showTelemetry && idleTrace && (
+        <div className="fixed top-2 right-2 z-[200] bg-neutral-950/90 border border-neutral-800 rounded-lg p-3 text-[10px] font-mono text-neutral-400 max-w-xs backdrop-blur-sm">
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-[9px] uppercase tracking-wider text-neutral-500 font-semibold">Idle Telemetry</span>
+            <button onClick={() => setShowTelemetry(false)} className="text-neutral-600 hover:text-neutral-300">×</button>
+          </div>
+          <div className="space-y-0.5">
+            <div>phase: <span className="text-neutral-300">{idleTrace.phase}</span></div>
+            <div>idle: <span className="text-neutral-300">{idleTrace.idle_ms}ms</span></div>
+            <div>remaining: <span className="text-neutral-300">{idleTrace.remaining}s</span></div>
+            <div>poll: <span className="text-neutral-300">{idleTrace.poll_ms}ms</span></div>
+            <div>confirms: <span className="text-neutral-300">{idleTrace.confirms}</span></div>
+            <div>latency: <span className="text-neutral-300">{idleTrace.total_latency_us}μs</span></div>
+            {idleTrace.samples.map((s) => (
+              <div key={s.method}>{s.method}: <span className="text-neutral-300">{s.idle_ms}ms</span> <span className="text-neutral-600">({s.latency_us}μs)</span></div>
+            ))}
+          </div>
+        </div>
+      )}
       <AddProgress />
       <Toast />
     </div>

@@ -7,6 +7,16 @@ interface NowPlaying {
   totalEntries: number;
 }
 
+interface IdleTrace {
+  idle_ms: number;
+  remaining: number;
+  total_latency_us: number;
+  poll_ms: number;
+  phase: string;
+  confirms: number;
+  samples: Array<{ method: string; idle_ms: number; latency_us: number }>;
+}
+
 interface AppState {
   config: AppConfig;
   editingItem: VideoItem | null;
@@ -15,6 +25,7 @@ interface AppState {
   isPlaying: boolean;
   nowPlaying: NowPlaying | null;
   idleRemaining: number;
+  idleTrace: IdleTrace | null;
   thumbnailCache: Record<string, string>;
   selectedIds: string[];
   addProgress: { current: number; total: number } | null;
@@ -57,7 +68,7 @@ export const useStore = create<AppState>((set, get) => ({
       idle_enabled: false,
       autoplay_on_idle: true,
       start_on_boot: false,
-      last_played_entry: null,
+      last_played_id: null,
     },
     videos: [],
   },
@@ -67,6 +78,7 @@ export const useStore = create<AppState>((set, get) => ({
   isPlaying: false,
   nowPlaying: null,
   idleRemaining: 120,
+  idleTrace: null,
   thumbnailCache: {},
   selectedIds: [],
   addProgress: null,
@@ -87,9 +99,9 @@ export const useStore = create<AppState>((set, get) => ({
       listen<NowPlaying>("now-playing", (event) => {
         set({ nowPlaying: event.payload });
       });
-      listen<{ remaining: number }>("idle-status", (event) => {
-        console.log("idle-status received:", event.payload.remaining);
-        set({ idleRemaining: event.payload.remaining });
+      listen<IdleTrace>("idle-status", (event) => {
+        const p = event.payload;
+        set({ idleRemaining: p.remaining, idleTrace: p });
       });
       listen<{ current: number; total: number }>("add-progress", (event) => {
         const p = event.payload;

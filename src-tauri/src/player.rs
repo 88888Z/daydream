@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::config;
 use tauri::Emitter;
+use tauri::Manager;
 
 #[derive(Debug, Snafu)]
 pub enum PlayerError {
@@ -123,7 +124,6 @@ impl MpvPlayer {
             use std::io::{BufRead, BufReader};
             use std::os::unix::net::UnixStream as UStream;
 
-            // Retry connect up to 10× (1s total)
             let mut stream = None;
             let mut retries = 0u32;
             for _ in 0..10 {
@@ -149,22 +149,41 @@ impl MpvPlayer {
                     match line {
                         Ok(json) => {
                             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&json) {
-                                let event_name = obj.get("event").and_then(|e| e.as_str()).unwrap_or("");
-                                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                                let event_name =
+                                    obj.get("event").and_then(|e| e.as_str()).unwrap_or("");
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis();
 
-                                // Log all key events with timestamps for transition latency tracking
-                                if event_name == "end-file" || event_name == "start-file" || event_name == "playback-restart" {
-                                    let eid = obj.get("playlist_entry_id").and_then(|e| e.as_u64()).unwrap_or(0);
-                                    eprintln!("[TIMING] mpv_event={} t={}ms entry_id={}", event_name, now_ms, eid);
+                                // Log every transition event with timing
+                                if event_name == "end-file"
+                                    || event_name == "start-file"
+                                    || event_name == "playback-restart"
+                                {
+                                    let eid = obj.get("playlist_entry_id")
+                                        .and_then(|e| e.as_u64()).unwrap_or(0);
+                                    eprintln!("[MPV] event={} t={}ms entry={}",
+                                        event_name, now_ms, eid);
                                 }
 
-                                // === start-file: carries playlist_entry_id, store immediately ===
+                                // === end-file: transition is starting (next file will load) ===
+                                if event_name == "end-file" {
+                                    crate::MPV_JUST_TRANSITIONED.store(
+                                        true, std::sync::atomic::Ordering::SeqCst,
+                                    );
+                                }
+
+                                // === start-file: carries playlist_entry_id, store UUID immediately ===
                                 if event_name == "start-file" {
-                                    last_entry_id = obj.get("playlist_entry_id").and_then(|e| e.as_u64());
+                                    last_entry_id = obj.get("playlist_entry_id")
+                                        .and_then(|e| e.as_u64());
                                     if let Some(eid) = last_entry_id {
                                         let idx = (eid as usize).saturating_sub(1);
-                                        crate::LAST_PLAYED_ENTRY_MS.store(idx as i64, std::sync::atomic::Ordering::SeqCst);
                                         if let Some(&item_idx) = entry_to_item.get(idx) {
+                                            if let Some(video) = items.get(item_idx) {
+                                                *crate::LAST_PLAYED_UUID.lock().unwrap() = Some(video.id.clone());
+                                            }
                                             let _ = app.emit("now-playing", serde_json::json!({
                                                 "itemIndex": item_idx,
                                                 "entryIndex": idx,
@@ -174,31 +193,45 @@ impl MpvPlayer {
                                     }
                                 }
 
-                                // === playback-restart: set transition flag, measure startup, apply speed/volume, emit now-playing ===
+                                // === playback-restart: set transition flag, measure startup, apply speed/volume ===
                                 if event_name == "playback-restart" {
-                                    crate::MPV_JUST_TRANSITIONED.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    crate::LAST_MPV_TRANSITION_MS.store(now_ms as i64, std::sync::atomic::Ordering::SeqCst);
-                                    crate::LAST_TRANSITION_AT.store(now_ms as i64, std::sync::atomic::Ordering::Release);
-                                    // Measure mpv startup delay (playback-restart is the first event that tells us mpv is ready)
-                                    let started = crate::MPV_STARTED_AT.load(std::sync::atomic::Ordering::Acquire);
+                                    crate::MPV_JUST_TRANSITIONED.store(
+                                        true, std::sync::atomic::Ordering::SeqCst,
+                                    );
+                                    crate::LAST_MPV_TRANSITION_MS.store(
+                                        now_ms as i64, std::sync::atomic::Ordering::SeqCst,
+                                    );
+                                    crate::LAST_TRANSITION_AT.store(
+                                        now_ms as i64, std::sync::atomic::Ordering::Release,
+                                    );
+
+                                    // Measure mpv startup delay
+                                    let started = crate::MPV_STARTED_AT.load(
+                                        std::sync::atomic::Ordering::Acquire,
+                                    );
                                     if started > 0 {
                                         let elapsed = (now_ms as i64) - started;
                                         if elapsed > 0 && elapsed < 30000 {
-                                            crate::LAST_STARTUP_MS.store(elapsed, std::sync::atomic::Ordering::Release);
-                                            eprintln!("[CAL] mpv_startup={}ms now={} started={}", elapsed, now_ms, started);
+                                            crate::LAST_STARTUP_MS.store(
+                                                elapsed, std::sync::atomic::Ordering::Release,
+                                            );
                                         }
                                     }
 
                                     let eid = last_entry_id.unwrap_or(1);
                                     let idx = (eid as usize).saturating_sub(1);
-                                    crate::LAST_PLAYED_ENTRY_MS.store(idx as i64, std::sync::atomic::Ordering::SeqCst);
 
-                                    // Apply speed/volume for the current video
+                                    // Apply speed/volume for the current video, store UUID
                                     if let Some(&item_idx) = entry_to_item.get(idx) {
                                         if let Some(video) = items.get(item_idx) {
+                                            *crate::LAST_PLAYED_UUID.lock().unwrap() = Some(video.id.clone());
                                             let params = video.local.as_ref().unwrap_or(&global);
-                                            let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "speed", params.speed]}));
-                                            let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "volume", params.volume]}));
+                                            let _ = Self::send_cmd(&serde_json::json!(
+                                                {"command": ["set_property", "speed", params.speed]}
+                                            ));
+                                            let _ = Self::send_cmd(&serde_json::json!(
+                                                {"command": ["set_property", "volume", params.volume]}
+                                            ));
                                         }
                                         let _ = app.emit("now-playing", serde_json::json!({
                                             "itemIndex": item_idx,
@@ -225,15 +258,10 @@ impl MpvPlayer {
     ) -> Result<(), PlayerError> {
         let _t = std::time::Instant::now();
         if items.is_empty() {
-            eprintln!("[TIMING] start_with_monitor {}us items=0 EMPTY", _t.elapsed().as_micros());
             return Ok(());
         }
-        let mut stop_time: u64 = 0;
-
         if self.is_running() {
-            let _stop_t = std::time::Instant::now();
             self.stop();
-            stop_time = _stop_t.elapsed().as_micros() as u64;
         }
 
         let (expanded_paths, entry_to_item) = Self::build_expanded_paths(items, global);
@@ -244,15 +272,12 @@ impl MpvPlayer {
                 entry_to_item.iter().position(|&i| i == item_idx)
             });
 
-        let _spawn_t = std::time::Instant::now();
         let (child, _) = self.spawn_mpv(&expanded_paths, rotate_to_entry)?;
-        let spawn_us = _spawn_t.elapsed().as_micros();
 
         let stop_signal = Arc::new(AtomicBool::new(false));
         *self.stop_signal.lock().unwrap() = Some(stop_signal.clone());
         *self.child.lock().unwrap() = Some(child);
 
-        // Spawn event reader immediately — it retries socket connect internally
         Self::connect_event_reader(
             stop_signal.clone(),
             entry_to_item.clone(),
@@ -262,8 +287,6 @@ impl MpvPlayer {
             app.clone(),
         );
 
-        // Fire-and-forget baseline now-playing and speed/volume
-        // If socket isn't ready yet, they silently fail — speed is re-set on first playback-restart
         let baseline_item = rotate_to.unwrap_or(0);
         let baseline_entry = rotate_to_entry.unwrap_or(0);
         let _ = app.emit("now-playing", serde_json::json!({
@@ -273,21 +296,23 @@ impl MpvPlayer {
         }));
         if let Some(first) = items.first() {
             let params = first.local.as_ref().unwrap_or(global);
-            let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "speed", params.speed]}));
-            let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "volume", params.volume]}));
+            let _ = Self::send_cmd(&serde_json::json!(
+                {"command": ["set_property", "speed", params.speed]}
+            ));
+            let _ = Self::send_cmd(&serde_json::json!(
+                {"command": ["set_property", "volume", params.volume]}
+            ));
         }
 
         let child_for_monitor = self.child.lock().unwrap().take();
         let app_clone = app.clone();
 
-        // Process monitor – waits for mpv to exit
         std::thread::spawn(move || {
             let mut child = child_for_monitor;
             let mut natural_exit = false;
 
             while let Some(ref mut c) = child {
                 if stop_signal.load(Ordering::SeqCst) {
-                    // stop() or new start_with_monitor triggered this — IS_PLAYING already handled
                     let _ = c.kill();
                     let _ = c.wait();
                     natural_exit = false;
@@ -310,14 +335,19 @@ impl MpvPlayer {
 
             let _ = std::fs::remove_file(PathBuf::from(MPV_SOCKET));
             if natural_exit {
-                eprintln!("[daydream-player] mpv exited naturally — stopping");
+                eprintln!("[MPV] natural_exit — stopping");
+                if let Some(uuid) = crate::LAST_PLAYED_UUID.lock().unwrap().take() {
+                    if let Some(state) = app_clone.try_state::<crate::config::ConfigState>() {
+                        let mut config = state.config.lock().unwrap();
+                        config.global.last_played_id = Some(uuid);
+                        let _ = state.save(&config);
+                    }
+                }
                 crate::IS_PLAYING.store(false, std::sync::atomic::Ordering::SeqCst);
                 let _ = app_clone.emit("playback-stopped", ());
             }
         });
 
-        eprintln!("[TIMING] start_with_monitor {}us spawn={}us stop={}us items={} expanded={}",
-            _t.elapsed().as_micros(), spawn_us, stop_time, items.len(), expanded_paths.len());
         Ok(())
     }
 

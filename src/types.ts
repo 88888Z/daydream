@@ -17,7 +17,7 @@ export interface GlobalSettings {
   idle_enabled: boolean;
   autoplay_on_idle: boolean;
   start_on_boot: boolean;
-  last_played_entry: number | null;
+  last_played_id: string | null;
 }
 
 export interface AppConfig {
