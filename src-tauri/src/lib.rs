@@ -88,7 +88,6 @@ fn idle_monitor_loop(app: AppHandle) {
     let mut previous_idle: Option<u64> = None;
     let mut consec_idle_for_autoplay: u64 = 0;
     let mut near_zero_count: u64 = 0;
-    let mut suppressed_count: u64 = 0;
     let mut steady_seen: bool = false;
     let mut after_climb: bool = false;
 
@@ -111,7 +110,6 @@ fn idle_monitor_loop(app: AppHandle) {
             previous_idle = None;
             consec_idle_for_autoplay = 0;
             near_zero_count = 0;
-            suppressed_count = 0;
             steady_seen = false;
             after_climb = false;
             continue;
@@ -124,7 +122,6 @@ fn idle_monitor_loop(app: AppHandle) {
                 previous_idle = None;
                 consec_idle_for_autoplay = 0;
                 near_zero_count = 0;
-                suppressed_count = 0;
                 steady_seen = false;
                 after_climb = false;
                 continue;
@@ -148,10 +145,6 @@ fn idle_monitor_loop(app: AppHandle) {
         }
 
         let remaining = timeout.saturating_sub(idle_secs.min(timeout));
-        eprintln!("[idle] tick t={}ms prev={:?} r={}s play={} det={} mpv={} nz={} cl={} st={} nz#={} ac={} ai={} sup={}",
-            idle_ms, prev, remaining, is_playing as u8, detected_interaction as u8, mpv_flag as u8,
-            near_zero as u8, timer_climbing as u8, steady_seen as u8, near_zero_count, after_climb as u8,
-            consec_idle_for_autoplay, suppressed_count);
         let _ = app.emit("idle-status", serde_json::json!({ "remaining": remaining }));
 
         // PATH 0: strong signal — real user interaction (no mpv)
@@ -162,8 +155,8 @@ fn idle_monitor_loop(app: AppHandle) {
                 .as_millis() as i64;
             let since_last_mpv = now_ms.saturating_sub(LAST_MPV_TRANSITION_MS.load(Ordering::SeqCst));
             if since_last_mpv > 2000 {
-                eprintln!("[idle] REAL-STOP {}→{}ms mpv_dist={}ms", prev.unwrap_or(0), idle_ms, since_last_mpv);
-                near_zero_count = 0; suppressed_count = 0; after_climb = false;
+                eprintln!("[idle] REAL-STOP {}→{}ms dist={}ms", prev.unwrap_or(0), idle_ms, since_last_mpv);
+                near_zero_count = 0; after_climb = false;
                 IS_PLAYING.store(false, Ordering::SeqCst);
                 let _ = app.emit("playback-stopped", ());
                 stop_playback(&app);
@@ -174,7 +167,6 @@ fn idle_monitor_loop(app: AppHandle) {
 
         // PATH 1: mpv transition
         if detected_interaction && mpv_flag {
-            suppressed_count += 1;
             near_zero_count = 0; after_climb = false;
             previous_idle = Some(idle_ms);
             consec_idle_for_autoplay = 0;
@@ -206,8 +198,8 @@ fn idle_monitor_loop(app: AppHandle) {
             previous_idle = Some(idle_ms);
             consec_idle_for_autoplay = 0;
             if near_zero_count >= 4 {
-                eprintln!("[idle] NZ-STOP idle={}ms nz#={}", idle_ms, near_zero_count);
-                near_zero_count = 0; suppressed_count = 0; after_climb = false;
+                eprintln!("[idle] NZ-STOP idle={}ms nz={}/4", idle_ms, near_zero_count);
+                near_zero_count = 0; after_climb = false;
                 IS_PLAYING.store(false, Ordering::SeqCst);
                 let _ = app.emit("playback-stopped", ());
                 stop_playback(&app);
@@ -215,12 +207,15 @@ fn idle_monitor_loop(app: AppHandle) {
             continue;
         }
 
-        // passthrough
+        // passthrough: only log climbing progression, silent otherwise
         near_zero_count = 0;
         previous_idle = Some(idle_ms);
 
         if idle_high_enough {
             after_climb = false;
+            if consec_idle_for_autoplay == 0 && !is_playing {
+                eprintln!("[idle] climbing r={}s idle={}ms", remaining, idle_ms);
+            }
             consec_idle_for_autoplay += 1;
             if consec_idle_for_autoplay >= 2 && should_autoplay && !is_playing {
                 eprintln!("[idle] AUTOPLAY videos={} rotate={:?}", videos.len(), last_played_from_config);
@@ -234,10 +229,10 @@ fn idle_monitor_loop(app: AppHandle) {
             consec_idle_for_autoplay = 0;
         }
 
-        // Only log slow ticks (>50ms overhead on 200ms sleep)
+        // slow tick monitor
         let tick_us = _tick_start.elapsed().as_micros();
-        if tick_us > 250_000 {
-            eprintln!("[TIMING] tick SLOW {}ms ({}us overhead)", tick_us / 1000, tick_us.saturating_sub(200_000));
+        if tick_us > 300_000 {
+            eprintln!("[TIMING] tick {}ms overhead {}ms", tick_us / 1000, tick_us.saturating_sub(200_000) / 1000);
         }
     }
 
