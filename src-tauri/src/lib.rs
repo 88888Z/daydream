@@ -116,7 +116,7 @@ impl Cal {
                 self.poll_ms = (self.poll_ms + 50).min(500);
                 eprintln!("[CAL] overhead {}us > target {}us → poll {}ms→{}ms",
                     self.tick_avg_us, target_overhead, old, self.poll_ms);
-            } else if self.tick_avg_us < target_overhead / 2 && self.poll_ms > 100 && self.tick_samples > 20 {
+            } else if self.tick_avg_us < target_overhead / 4 && self.poll_ms > 100 && self.tick_samples > 20 {
                 let old = self.poll_ms;
                 self.poll_ms = (self.poll_ms - 50).max(100);
                 eprintln!("[CAL] overhead {}us < target/2 → poll {}ms→{}ms",
@@ -173,7 +173,7 @@ fn idle_monitor_loop(app: AppHandle) {
     let mut steady: bool = false;
     let mut ac: bool = false;
     let mut cd: u64 = 0;
-    let mut jz: u64 = 0; // jitter skip counter
+    let mut jitter_until: Option<std::time::Instant> = None;
     let mut cal = Cal::new();
     let mut hist: [u64; 10] = [0; 10];
     let mut hp: usize = 0;
@@ -226,11 +226,12 @@ fn idle_monitor_loop(app: AppHandle) {
             if cal.detect_samples > 5 && drop > cal.max_jitter_drop {
                 cal.record_jitter(drop);
             }
-            // Jitter envelope: if drop within known jitter ×1.2, skip NZ for enough ticks
+            // Jitter envelope: if drop within known jitter ×1.2, suppress NZ for 8s
             if cal.max_jitter_drop > 0 && drop <= cal.max_jitter_drop * 120 / 100 {
-                jz = cal.nz_curr + 4;
-                eprintln!("[CAL] jitter_env drop={}ms max_jitter={}ms → skip NZ for {} ticks",
-                    drop, cal.max_jitter_drop, jz);
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                jitter_until = Some(until);
+                eprintln!("[CAL] jitter_env drop={}ms max_jitter={}ms — suppress NZ until +8s",
+                    drop, cal.max_jitter_drop);
             }
             eprintln!("[idle] DETECT#{}=drop={}ms hist=[{}] prev={:?} curr={}", cd, drop, h.join(","), p, idle_ms);
         } else { cd = 0; }
@@ -241,10 +242,12 @@ fn idle_monitor_loop(app: AppHandle) {
         if playing && s < 1 && !mpv {
             if !steady { prev = Some(idle_ms); ai = 0; continue; }
             if ac { ac = false; prev = Some(idle_ms); ai = 0; continue; }
-            if jz > 0 {
-                jz -= 1;
-                if jz == 0 { eprintln!("[CAL] jitter_skip expired — NZ counting resumed"); }
-                prev = Some(idle_ms); ai = 0; continue;
+            if let Some(until) = jitter_until {
+                if std::time::Instant::now() < until {
+                    prev = Some(idle_ms); ai = 0; continue;
+                }
+                jitter_until = None;
+                eprintln!("[CAL] jitter_window expired after 8s — NZ counting resumed");
             }
             nz += 1; prev = Some(idle_ms); ai = 0;
             if nz >= cal.nz_curr {
@@ -258,7 +261,7 @@ fn idle_monitor_loop(app: AppHandle) {
             continue;
         }
 
-        nz = 0; jz = 0; prev = Some(idle_ms);
+        nz = 0; jitter_until = None; prev = Some(idle_ms);
 
         if s >= timeout {
             ac = false;
@@ -277,9 +280,10 @@ fn idle_monitor_loop(app: AppHandle) {
         let overhead_us = tus.saturating_sub(cal.poll_ms * 1000);
         cal.record_overhead(overhead_us);
         if overhead_us > cal.poll_ms * 500 {
-            eprintln!("[TIMING] tick {}ms poll={}ms overhead={}ms jz={} nz={} dt={} cyc={}",
+            let jw = jitter_until.map(|u| u.saturating_duration_since(std::time::Instant::now()).as_secs()).unwrap_or(0);
+            eprintln!("[TIMING] tick {}ms poll={}ms overhead={}ms jw={}s nz={} dt={} cyc={}",
                 tus / 1000, cal.poll_ms, overhead_us / 1000,
-                jz, cal.nz_curr, cal.drop_thresh, cal.cycles);
+                jw, cal.nz_curr, cal.drop_thresh, cal.cycles);
         }
     }
 
