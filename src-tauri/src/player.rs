@@ -273,33 +273,35 @@ impl MpvPlayer {
         // Process monitor – waits for mpv to exit
         std::thread::spawn(move || {
             let mut child = child_for_monitor;
-            let mut exited = false;
+            let mut natural_exit = false;
 
             while let Some(ref mut c) = child {
                 if stop_signal.load(Ordering::SeqCst) {
+                    // stop() or new start_with_monitor triggered this — IS_PLAYING already handled
                     let _ = c.kill();
                     let _ = c.wait();
-                    exited = true;
+                    natural_exit = false;
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(300));
                 match c.try_wait() {
                     Ok(Some(_)) => {
                         let _ = c.wait();
-                        exited = true;
+                        natural_exit = true;
                         break;
                     }
                     Ok(None) => {}
                     Err(_) => {
-                        exited = true;
+                        natural_exit = false;
                         break;
                     }
                 }
             }
 
             let _ = std::fs::remove_file(PathBuf::from(MPV_SOCKET));
-            if exited {
-                crate::IS_PLAYING.store(false, Ordering::SeqCst);
+            if natural_exit {
+                eprintln!("[daydream-player] mpv exited naturally — stopping");
+                crate::IS_PLAYING.store(false, std::sync::atomic::Ordering::SeqCst);
                 let _ = app_clone.emit("playback-stopped", ());
             }
         });
