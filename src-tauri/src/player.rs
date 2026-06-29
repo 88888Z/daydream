@@ -139,6 +139,8 @@ impl MpvPlayer {
                         Ok(json) => {
                             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&json) {
                                 if obj.get("event").and_then(|e| e.as_str()) == Some("playback-restart") {
+                                    crate::MPV_JUST_TRANSITIONED.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    eprintln!("[daydream-player] playback-restart — set MPV_JUST_TRANSITIONED=true");
                                     if let Some(entry_id) = obj.get("playlist_entry_id").and_then(|e| e.as_u64()) {
                                         let idx = (entry_id as usize).saturating_sub(1);
                                         if let Some(&item_idx) = entry_to_item.get(idx) {
