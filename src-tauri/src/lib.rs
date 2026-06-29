@@ -225,7 +225,7 @@ impl NoiseModel {
     fn recovery_ms(&self) -> u64 {
         let bw = self.block_window_ms();
         let rec_p50 = self.transition_rec.percentile(50.0);
-        bw + rec_p50.max(bw / 2)
+        bw + rec_p50
     }
 
     fn noise_p99(&self) -> u64 {
