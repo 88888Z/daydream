@@ -379,22 +379,25 @@ impl NoiseModel {
             }
         }
 
-        // ── CONFIRM — just idle < recovery_ms ───────────────────────
+        // ── CONFIRM — only count ticks where idle is VERY_LOW ────
+        // Stalls when idle is between VERY_LOW and rec_ms; aborts when idle >= rec_ms
         if self.signal_triggered {
             if idle_ms < rec_ms {
-                self.consecutive_signal += 1;
-                if self.consecutive_signal >= self.min_confirmations {
-                    self.total_stops += 1;
-                    let p95 = self.noise_drops.p95();
-                    let p99 = self.noise_drops.p99();
-                    self.l(format!("STOP total={} idle={}ms drop={}ms score={} conf={}/{} p95={}ms p99={}ms rec={}ms poll={}ms clean={}",
-                        self.total_stops, idle_ms, drop, score,
-                        self.consecutive_signal, self.min_confirmations,
-                        p95, p99, rec_ms, self.poll_ms, self.clean_samples));
-                    self.signal_triggered = false;
-                    self.consecutive_signal = 0;
-                    self.tracked_exit = true;
-                    return Action::Stop;
+                if idle_ms < VERY_LOW {
+                    self.consecutive_signal += 1;
+                    if self.consecutive_signal >= self.min_confirmations {
+                        self.total_stops += 1;
+                        let p95 = self.noise_drops.p95();
+                        let p99 = self.noise_drops.p99();
+                        self.l(format!("STOP total={} idle={}ms drop={}ms score={} conf={}/{} p95={}ms p99={}ms rec={}ms poll={}ms clean={}",
+                            self.total_stops, idle_ms, drop, score,
+                            self.consecutive_signal, self.min_confirmations,
+                            p95, p99, rec_ms, self.poll_ms, self.clean_samples));
+                        self.signal_triggered = false;
+                        self.consecutive_signal = 0;
+                        self.tracked_exit = true;
+                        return Action::Stop;
+                    }
                 }
                 self.l(format!("CONFIRM tick={} idle={}ms conf={}/{} rec={}ms",
                     self.tick_count, idle_ms,
