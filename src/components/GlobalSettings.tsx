@@ -51,7 +51,7 @@ export default function GlobalSettingsPanel() {
             min={10}
             max={600}
             step={10}
-            display={`${Math.round(settings.idle_timeout_seconds / 60)}m ${settings.idle_timeout_seconds % 60}s`}
+            display={`${Math.floor(settings.idle_timeout_seconds / 60)}m ${settings.idle_timeout_seconds % 60}s`}
             onChange={(v) => update({ idle_timeout_seconds: v })}
           />
 
