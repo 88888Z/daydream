@@ -89,6 +89,8 @@ fn idle_monitor_loop(app: AppHandle) {
     let mut consec_idle_for_autoplay: u64 = 0;
     let mut near_zero_count: u64 = 0;
     let mut steady_seen: bool = false;
+    let mut nz_threshold: u64 = 4;
+    let mut last_stop: Option<std::time::Instant> = None;
     let mut after_climb: bool = false;
     let mut consec_detected: u64 = 0;
     // Ring buffer of last 10 idle_ms values for jitter diagnosis
@@ -197,8 +199,18 @@ fn idle_monitor_loop(app: AppHandle) {
             near_zero_count += 1;
             previous_idle = Some(idle_ms);
             consec_idle_for_autoplay = 0;
-            if near_zero_count >= 4 {
-                eprintln!("[idle] NZ-STOP idle={}ms nz={}/4", idle_ms, near_zero_count);
+            if near_zero_count >= nz_threshold {
+                // Adaptive threshold: if stops happen rapidly, increase threshold to break the cycle
+                let since_last = last_stop.map(|t| t.elapsed().as_secs()).unwrap_or(99);
+                if since_last < 10 {
+                    nz_threshold = (nz_threshold + 2).min(14);
+                    eprintln!("[idle] NZ-STOP idle={}ms nz={}/{} fast_cycle={}s threshold→{}",
+                        idle_ms, near_zero_count, nz_threshold, since_last, nz_threshold);
+                } else {
+                    nz_threshold = 4;
+                    eprintln!("[idle] NZ-STOP idle={}ms nz={}/{}", idle_ms, near_zero_count, nz_threshold);
+                }
+                last_stop = Some(std::time::Instant::now());
                 near_zero_count = 0; after_climb = false;
                 IS_PLAYING.store(false, Ordering::SeqCst);
                 let _ = app.emit("playback-stopped", ());
