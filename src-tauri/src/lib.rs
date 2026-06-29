@@ -84,85 +84,120 @@ fn manual_stop(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+use std::collections::VecDeque;
+
+fn avg<I: IntoIterator<Item = u64>>(vals: I) -> u64 {
+    let mut s = 0u64; let mut n = 0u64;
+    for v in vals { s += v; n += 1; }
+    if n == 0 { 0 } else { s / n }
+}
+
 struct Cal {
     poll_ms: u64, drop_thresh: u64,
-    nz_base: u64, nz_curr: u64, nz_max: u64,
+    nz_target: u64, jitter_window_ms: u64,
     max_jitter_drop: u64,
-    detect_avg_us: u64, detect_samples: u64, tick_avg_us: u64, tick_samples: u64,
-    last_stop_at: Option<std::time::Instant>, cycle_speed: u64, cycles: u64,
+    jitter_drops: VecDeque<u64>,
+    jitter_rec_ms: VecDeque<u64>,
+    detect_avg_us: u64, detect_n: u64,
+    tick_avg_us: u64, tick_n: u64,
+    last_stop: Option<std::time::Instant>,
+    jitter_start: Option<std::time::Instant>,
+    cycles: u64,
 }
 
 impl Cal {
     fn new() -> Self {
         Self {
-            poll_ms: 200, drop_thresh: 1500,
-            nz_base: 4, nz_curr: 4, nz_max: 4,
+            poll_ms: 200, drop_thresh: 1500, nz_target: 4, jitter_window_ms: 2000,
             max_jitter_drop: 0,
-            detect_avg_us: 0, detect_samples: 0, tick_avg_us: 0, tick_samples: 0,
-            last_stop_at: None, cycle_speed: 0, cycles: 0,
+            jitter_drops: VecDeque::new(), jitter_rec_ms: VecDeque::new(),
+            detect_avg_us: 0, detect_n: 0, tick_avg_us: 0, tick_n: 0,
+            last_stop: None, jitter_start: None, cycles: 0,
         }
     }
 
-    fn record_overhead(&mut self, overhead_us: u64) {
-        if self.tick_samples == 0 { self.tick_avg_us = overhead_us; }
-        else { self.tick_avg_us = (self.tick_avg_us * self.tick_samples + overhead_us) / (self.tick_samples + 1); }
-        self.tick_samples += 1;
-        if self.tick_samples >= 5 {
-            // overhead budget: 10% of poll time
-            let target_overhead = self.poll_ms * 100;
-            if self.tick_avg_us > target_overhead && self.poll_ms < 500 {
+    fn env_factor(&self) -> u64 {
+        let n = self.jitter_drops.len();
+        if n < 3 { return 120; }
+        let m = avg(self.jitter_drops.iter().copied());
+        let v = avg(self.jitter_drops.iter().map(|&x| x.abs_diff(m).pow(2)));
+        let sd = (v as f64).sqrt() as u64;
+        if m == 0 { 120 } else { ((m + sd * 3) * 100 / m).max(110).min(300) }
+    }
+
+    fn calibrate_nz(&mut self) { self.nz_target = (2000u64 / self.poll_ms).max(3); }
+
+    fn calibrate_win(&mut self) {
+        let r = avg(self.jitter_rec_ms.iter().copied());
+        self.jitter_window_ms = if r > 0 { r + 1000 } else { 2000 };
+    }
+
+    fn record_overhead(&mut self, us: u64) {
+        self.tick_n += 1;
+        self.tick_avg_us = (self.tick_avg_us * (self.tick_n - 1) + us) / self.tick_n;
+        if self.tick_n >= 5 {
+            let budget = self.poll_ms * 80;
+            if self.tick_avg_us > budget && self.poll_ms < 500 {
                 let old = self.poll_ms;
                 self.poll_ms = (self.poll_ms + 50).min(500);
-                eprintln!("[CAL] overhead {}us > target {}us → poll {}ms→{}ms",
-                    self.tick_avg_us, target_overhead, old, self.poll_ms);
-            } else if self.tick_avg_us < target_overhead / 4 && self.poll_ms > 100 && self.tick_samples > 20 {
+                eprintln!("[CAL] ovh={}us > budget={}us poll {}→{}ms nz={}", self.tick_avg_us, budget, old, self.poll_ms, self.nz_target);
+                self.calibrate_nz();
+            } else if self.tick_avg_us < budget / 4 && self.poll_ms > 100 && self.tick_n > 20 {
                 let old = self.poll_ms;
                 self.poll_ms = (self.poll_ms - 50).max(100);
-                eprintln!("[CAL] overhead {}us < target/2 → poll {}ms→{}ms",
-                    self.tick_avg_us, old, self.poll_ms);
+                eprintln!("[CAL] ovh={}us < budget/4 poll {}→{}ms nz={}", self.tick_avg_us, old, self.poll_ms, self.nz_target);
+                self.calibrate_nz();
             }
         }
     }
 
     fn record_detect(&mut self, us: u64) {
-        if self.detect_samples == 0 { self.detect_avg_us = us; }
-        else { self.detect_avg_us = (self.detect_avg_us * self.detect_samples + us) / (self.detect_samples + 1); }
-        self.detect_samples += 1;
-        if self.detect_samples == 10 {
-            eprintln!("[CAL] detect avg={}us samples={}", self.detect_avg_us, self.detect_samples);
+        self.detect_n += 1;
+        self.detect_avg_us = (self.detect_avg_us * (self.detect_n - 1) + us) / self.detect_n;
+        if self.detect_n == 10 { eprintln!("[CAL] detect avg={}us n={}", self.detect_avg_us, self.detect_n); }
+    }
+
+    fn record_jitter(&mut self, drop: u64, now: std::time::Instant) {
+        if drop > self.max_jitter_drop { self.max_jitter_drop = drop; }
+        self.jitter_drops.push_back(drop);
+        if self.jitter_drops.len() > 10 { self.jitter_drops.pop_front(); }
+        self.jitter_start = Some(now);
+        let f = self.env_factor();
+        let nd = (drop * f / 100).max(self.drop_thresh);
+        if nd != self.drop_thresh || drop == self.max_jitter_drop {
+            let old = self.drop_thresh;
+            self.drop_thresh = nd;
+            if old != nd { eprintln!("[CAL] jit drop={} env={}% dt={}→{}ms", drop, f, old, self.drop_thresh); }
         }
     }
 
-    fn record_jitter(&mut self, drop: u64) {
-        if drop > self.max_jitter_drop {
-            let old = self.drop_thresh;
-            self.max_jitter_drop = drop;
-            self.drop_thresh = (drop as f64 * 1.5) as u64;
-            eprintln!("[CAL] jitter max={}ms drop={}ms→{}ms (×1.5)", drop, old, self.drop_thresh);
+    fn record_recovery(&mut self) {
+        if let Some(start) = self.jitter_start {
+            let ms = start.elapsed().as_millis() as u64;
+            self.jitter_rec_ms.push_back(ms);
+            if self.jitter_rec_ms.len() > 5 { self.jitter_rec_ms.pop_front(); }
+            self.calibrate_win();
+            eprintln!("[CAL] rec={}ms win={}ms n={}", ms, self.jitter_window_ms, self.jitter_rec_ms.len());
+            self.jitter_start = None;
         }
     }
 
     fn record_stop(&mut self, timeout: u64) {
         let now = std::time::Instant::now();
-        let since = self.last_stop_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(999.0);
-        if since < 30.0 {
-            self.cycle_speed = (self.cycle_speed * self.cycles + since as u64) / (self.cycles + 1);
+        let gap = self.last_stop.map(|t| t.elapsed().as_secs_f64()).unwrap_or(999.0);
+        if gap < 30.0 {
             self.cycles += 1;
-            let new_nz = (self.nz_curr + timeout).min(timeout * 2);
-            if new_nz != self.nz_curr {
-                eprintln!("[CAL] cycle#{} gap={}s speed_avg={}s nz={}→{} (jump by timeout={})",
-                    self.cycles, since as u64, self.cycle_speed, self.nz_curr, new_nz, timeout);
-                self.nz_curr = new_nz;
+            let nz = (self.nz_target + self.cycles * timeout / 2).min(timeout * 2);
+            if nz != self.nz_target {
+                eprintln!("[CAL] cycle#{} gap={}s nz={}→{}", self.cycles, gap as u64, self.nz_target, nz);
+                self.nz_target = nz;
             }
         } else {
-            if self.cycles > 0 {
-                eprintln!("[CAL] calm gap={}s after {} cycles — nz={}→{}", since as u64, self.cycles, self.nz_curr, self.nz_base);
-            }
-            self.nz_curr = self.nz_base;
-            self.cycles = 0; self.cycle_speed = 0;
+            if self.cycles > 0 { eprintln!("[CAL] calm {}s after {} cycles nz={}→{}", gap as u64, self.cycles, self.nz_target, self.poll_ms); }
+            self.calibrate_nz();
+            self.cycles = 0;
         }
-        self.last_stop_at = Some(now);
+        self.last_stop = Some(now);
     }
 }
 
@@ -193,7 +228,6 @@ fn idle_monitor_loop(app: AppHandle) {
         let lpc = config.global.last_played_entry;
         let playing = IS_PLAYING.load(Ordering::SeqCst);
         drop(config);
-        cal.nz_max = cal.nz_max.max(timeout.min(14));
 
         if !enabled || videos.is_empty() {
             prev = None; ai = 0; nz = 0; steady = false; ac = false; hp = 0; cd = 0;
@@ -222,22 +256,24 @@ fn idle_monitor_loop(app: AppHandle) {
         if det && !mpv && playing {
             let h: Vec<String> = hist.iter().enumerate().map(|(i, &v)| format!("{}:{}", i, v)).collect();
             cd += 1;
-            // calibrate: if drop is > our threshold and has happened before, it's jitter not user
-            if cal.detect_samples > 5 && drop > cal.max_jitter_drop {
-                cal.record_jitter(drop);
+            let now = std::time::Instant::now();
+            // record jitter sample
+            if cal.detect_n > 5 { cal.record_jitter(drop, now); }
+            // suppress NZ if within measured envelope
+            let factor = cal.env_factor();
+            if cal.max_jitter_drop > 0 && drop <= cal.drop_thresh {
+                let win_ms = cal.jitter_window_ms;
+                jitter_until = Some(now + std::time::Duration::from_millis(win_ms));
+                eprintln!("[CAL] jit drop={} env={}% win={}ms nz={}", drop, factor, win_ms, cal.nz_target);
             }
-            // Jitter envelope: suppress NZ briefly during known jitter pattern
-            if cal.max_jitter_drop > 0 && drop <= cal.max_jitter_drop * 120 / 100 {
-                let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                jitter_until = Some(until);
-                eprintln!("[CAL] jitter_env drop={}ms max={}ms — suppress NZ 3s",
-                    drop, cal.max_jitter_drop);
-            }
-            eprintln!("[idle] DETECT#{}=drop={}ms hist=[{}] prev={:?} curr={}", cd, drop, h.join(","), p, idle_ms);
+            eprintln!("[idle] DETECT#{} drop={}ms hist=[{}] p={:?} c={}", cd, drop, h.join(","), p, idle_ms);
         } else { cd = 0; }
 
         if det && mpv { nz = 0; ac = false; prev = Some(idle_ms); ai = 0; continue; }
-        if playing && !det && s >= 1 { nz = 0; ac = true; prev = Some(idle_ms); ai = 0; continue; }
+        if playing && !det && s >= 1 {
+            if s == 1 { cal.record_recovery(); }
+            nz = 0; ac = true; prev = Some(idle_ms); ai = 0; continue;
+        }
 
         if playing && s < 1 && !mpv {
             if !steady { prev = Some(idle_ms); ai = 0; continue; }
@@ -250,9 +286,9 @@ fn idle_monitor_loop(app: AppHandle) {
                 eprintln!("[CAL] jitter_window expired — NZ counting resumed");
             }
             nz += 1; prev = Some(idle_ms); ai = 0;
-            if nz >= cal.nz_curr {
+            if nz >= cal.nz_target {
                 cal.record_stop(timeout);
-                eprintln!("[idle] NZ-STOP idle={}ms nz={}/{}", idle_ms, nz, cal.nz_curr);
+                eprintln!("[idle] NZ-STOP idle={}ms nz={}/{} nz_target={}", idle_ms, nz, cal.nz_target, cal.nz_target);
                 nz = 0; ac = false;
                 IS_PLAYING.store(false, Ordering::SeqCst);
                 let _ = app.emit("playback-stopped", ());
@@ -281,9 +317,10 @@ fn idle_monitor_loop(app: AppHandle) {
         cal.record_overhead(overhead_us);
         if overhead_us > cal.poll_ms * 500 {
             let jw = jitter_until.map(|u| u.saturating_duration_since(std::time::Instant::now()).as_secs()).unwrap_or(0);
-            eprintln!("[TIMING] tick {}ms poll={}ms overhead={}ms jw={}s nz={} dt={} cyc={}",
+            eprintln!("[TIMING] tick {}ms p={}ms ovh={}ms jw={}s nz={} dt={} cyc={} win={}ms rec={}",
                 tus / 1000, cal.poll_ms, overhead_us / 1000,
-                jw, cal.nz_curr, cal.drop_thresh, cal.cycles);
+                jw, cal.nz_target, cal.drop_thresh, cal.cycles,
+                cal.jitter_window_ms, avg(cal.jitter_rec_ms.iter().copied()));
         }
     }
 
