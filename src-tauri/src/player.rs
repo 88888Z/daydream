@@ -179,7 +179,9 @@ impl MpvPlayer {
                                 // === playback-restart: set transition flag, apply speed/volume, emit now-playing ===
                                 if event_name == "playback-restart" {
                                     crate::MPV_JUST_TRANSITIONED.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    eprintln!("[daydream-player] playback-restart — set MPV_JUST_TRANSITIONED=true");
+                                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+                                    crate::LAST_MPV_TRANSITION_MS.store(now_ms, std::sync::atomic::Ordering::SeqCst);
+                                    eprintln!("[daydream-player] playback-restart — set MPV_ flags transition_ms={}", now_ms);
 
                                     let eid = last_entry_id.unwrap_or(1);
                                     let idx = (eid as usize).saturating_sub(1);
@@ -334,17 +336,25 @@ impl MpvPlayer {
     }
 
     fn send_cmd(cmd: &serde_json::Value) -> Result<(), PlayerError> {
+        let start = std::time::Instant::now();
         let socket_path = PathBuf::from(MPV_SOCKET);
         if !socket_path.exists() {
+            eprintln!("[daydream-player] send_cmd TIMING socket_check={}us", start.elapsed().as_micros());
             return Err(PlayerError::NotRunning);
         }
         let mut stream =
             UnixStream::connect(&socket_path).map_err(|_| PlayerError::NotRunning)?;
+        let after_connect = std::time::Instant::now();
         let data = serde_json::to_vec(cmd).map_err(|e| PlayerError::Command {
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         })?;
         stream.write_all(&data).map_err(|e| PlayerError::Command { source: e })?;
         stream.write_all(b"\n").map_err(|e| PlayerError::Command { source: e })?;
+        let done = std::time::Instant::now();
+        eprintln!("[daydream-player] send_cmd TIMING total={}us connect={}us write={}us",
+            done.duration_since(start).as_micros(),
+            after_connect.duration_since(start).as_micros(),
+            done.duration_since(after_connect).as_micros());
         Ok(())
     }
 
