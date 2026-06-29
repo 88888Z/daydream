@@ -120,6 +120,8 @@ impl MpvPlayer {
         stop_signal: Arc<AtomicBool>,
         entry_to_item: Vec<usize>,
         total_items: usize,
+        items: Vec<config::VideoItem>,
+        global: config::VideoParams,
         app: tauri::AppHandle,
     ) {
         std::thread::spawn(move || {
@@ -174,7 +176,7 @@ impl MpvPlayer {
                                     }
                                 }
 
-                                // === playback-restart: set transition flag, also store using cached entry_id ===
+                                // === playback-restart: set transition flag, apply speed/volume, emit now-playing ===
                                 if event_name == "playback-restart" {
                                     crate::MPV_JUST_TRANSITIONED.store(true, std::sync::atomic::Ordering::SeqCst);
                                     eprintln!("[daydream-player] playback-restart — set MPV_JUST_TRANSITIONED=true");
@@ -183,7 +185,15 @@ impl MpvPlayer {
                                     let idx = (eid as usize).saturating_sub(1);
                                     eprintln!("[daydream-player] playback-restart using entry_id={:?} idx={}", last_entry_id, idx);
                                     crate::LAST_PLAYED_ENTRY_MS.store(idx as i64, std::sync::atomic::Ordering::SeqCst);
+
+                                    // Apply speed/volume for the current video
                                     if let Some(&item_idx) = entry_to_item.get(idx) {
+                                        if let Some(video) = items.get(item_idx) {
+                                            let params = video.local.as_ref().unwrap_or(&global);
+                                            eprintln!("[daydream-player] transition speed={} volume={} for {}", params.speed, params.volume, video.filename);
+                                            let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "speed", params.speed]}));
+                                            let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "volume", params.volume]}));
+                                        }
                                         let _ = app.emit("now-playing", serde_json::json!({
                                             "itemIndex": item_idx,
                                             "entryIndex": idx,
@@ -247,6 +257,8 @@ impl MpvPlayer {
                         stop_signal.clone(),
                         entry_to_item.clone(),
                         total_items,
+                        items.to_vec(),
+                        global.clone(),
                         app.clone(),
                     );
                     reader_spawned = true;
@@ -277,8 +289,8 @@ impl MpvPlayer {
         if let Some(first) = items.first() {
             let params = first.local.as_ref().unwrap_or(global);
             eprintln!("[daydream-player] set speed={} volume={} for first item {}", params.speed, params.volume, first.filename);
-            let _ = self.send_json(&serde_json::json!({"command": ["set_property", "speed", params.speed]}));
-            let _ = self.send_json(&serde_json::json!({"command": ["set_property", "volume", params.volume]}));
+            let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "speed", params.speed]}));
+            let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "volume", params.volume]}));
         }
 
         let child_for_monitor = self.child.lock().unwrap().take();
@@ -321,7 +333,7 @@ impl MpvPlayer {
         Ok(())
     }
 
-    fn send_json(&self, cmd: &serde_json::Value) -> Result<(), PlayerError> {
+    fn send_cmd(cmd: &serde_json::Value) -> Result<(), PlayerError> {
         let socket_path = PathBuf::from(MPV_SOCKET);
         if !socket_path.exists() {
             return Err(PlayerError::NotRunning);
