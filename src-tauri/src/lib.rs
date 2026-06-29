@@ -48,6 +48,9 @@ fn manual_play(app: AppHandle, state: tauri::State<ConfigState>,
     let videos = config.videos.clone();
     let global = config.global.default_params.clone();
     let last_played = config.global.last_played_entry;
+    eprintln!("[daydream] manual_play: videos in order ({}) {:?}",
+        videos.len(),
+        videos.iter().enumerate().map(|(i, v)| format!("{}:{}", i, v.filename)).collect::<Vec<_>>());
     drop(config);
 
     if videos.is_empty() {
@@ -221,8 +224,9 @@ fn idle_monitor_loop(app: AppHandle) {
             after_climb = false;
             consec_idle_for_autoplay += 1;
             if consec_idle_for_autoplay >= 2 && should_autoplay && !is_playing {
-                eprintln!("[daydream-idle] AUTOPLAY last_played_from_config={:?} — calling start_playback with rotate_to={:?}",
-                    last_played_from_config, last_played_from_config);
+                eprintln!("[daydream-idle] AUTOPLAY last_played_from_config={:?} rotate_to={:?} videos ({}) order: {:?}",
+                    last_played_from_config, last_played_from_config, videos.len(),
+                    videos.iter().enumerate().map(|(i, v)| format!("{}:{}", i, v.filename)).collect::<Vec<_>>());
                 IS_PLAYING.store(true, Ordering::SeqCst);
                 let _ = app.emit("playback-started", ());
                 if let Err(e) = start_playback(&app, &videos, &global_params, last_played_from_config) {

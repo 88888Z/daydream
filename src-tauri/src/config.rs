@@ -185,12 +185,19 @@ pub fn remove_video(state: State<ConfigState>, id: String) -> Result<(), String>
 pub fn reorder_videos(state: State<ConfigState>, ids: Vec<String>) -> Result<(), String> {
     let mut config = state.config.lock().unwrap();
     let mut ordered = Vec::with_capacity(ids.len());
-    for id in &ids {
+    eprintln!("[daydream-config] reorder_videos: received {} ids", ids.len());
+    for (pos, id) in ids.iter().enumerate() {
         if let Some(item) = config.videos.iter().find(|v| &v.id == id) {
+            eprintln!("[daydream-config] reorder  pos={} filename={} id={}", pos, item.filename, id);
             ordered.push(item.clone());
+        } else {
+            eprintln!("[daydream-config] reorder  pos={} id={} NOT FOUND in config.videos!", pos, id);
         }
     }
+    eprintln!("[daydream-config] reorder_videos: old order {:?}", config.videos.iter().map(|v| v.filename.clone()).collect::<Vec<_>>());
     config.videos = ordered;
+    let new_order: Vec<String> = config.videos.iter().map(|v| v.filename.clone()).collect();
+    eprintln!("[daydream-config] reorder_videos: new order {:?}", new_order);
     state.save(&config).map_err(|e| e.to_string())?;
     Ok(())
 }

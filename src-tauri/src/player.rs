@@ -45,15 +45,21 @@ impl MpvPlayer {
         items: &[config::VideoItem],
         global: &config::VideoParams,
     ) -> (Vec<String>, Vec<usize>) {
+        eprintln!("[daydream-player] build_expanded_paths: {} items in order: {:?}",
+            items.len(),
+            items.iter().enumerate().map(|(i, v)| format!("{}:{}", i, v.filename)).collect::<Vec<_>>());
         let mut paths: Vec<String> = Vec::new();
         let mut map: Vec<usize> = Vec::new();
         for (idx, item) in items.iter().enumerate() {
             let params = item.local.as_ref().unwrap_or(global);
-            for _ in 0..params.repeats.max(1) {
+            for r in 0..params.repeats.max(1) {
                 paths.push(item.path.clone());
                 map.push(idx);
+                eprintln!("[daydream-player] build  item_idx={} repeat={}/{} filename={} path={}",
+                    idx, r + 1, params.repeats.max(1), item.filename, item.path);
             }
         }
+        eprintln!("[daydream-player] build_expanded_paths: total expanded entries={}", paths.len());
         (paths, map)
     }
 
@@ -90,7 +96,9 @@ impl MpvPlayer {
         } else {
             eprintln!("[daydream] no --playlist-start (rotate_to_entry=None, expanded_paths_count={})", expanded_paths.len());
         }
-        for p in expanded_paths.iter() {
+        for (i, p) in expanded_paths.iter().enumerate() {
+            let fname = std::path::Path::new(p).file_name().map(|n| n.to_string_lossy()).unwrap_or(std::borrow::Cow::Borrowed("?"));
+            eprintln!("[daydream-player] mpv arg path={} filename={}", i, fname);
             args.push(p.clone());
         }
 
