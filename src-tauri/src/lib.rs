@@ -226,11 +226,11 @@ fn idle_monitor_loop(app: AppHandle) {
             if cal.detect_samples > 5 && drop > cal.max_jitter_drop {
                 cal.record_jitter(drop);
             }
-            // Jitter envelope: if drop within known jitter ×1.2, suppress NZ for 8s
+            // Jitter envelope: suppress NZ briefly during known jitter pattern
             if cal.max_jitter_drop > 0 && drop <= cal.max_jitter_drop * 120 / 100 {
-                let until = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
                 jitter_until = Some(until);
-                eprintln!("[CAL] jitter_env drop={}ms max_jitter={}ms — suppress NZ until +8s",
+                eprintln!("[CAL] jitter_env drop={}ms max={}ms — suppress NZ 3s",
                     drop, cal.max_jitter_drop);
             }
             eprintln!("[idle] DETECT#{}=drop={}ms hist=[{}] prev={:?} curr={}", cd, drop, h.join(","), p, idle_ms);
@@ -247,7 +247,7 @@ fn idle_monitor_loop(app: AppHandle) {
                     prev = Some(idle_ms); ai = 0; continue;
                 }
                 jitter_until = None;
-                eprintln!("[CAL] jitter_window expired after 8s — NZ counting resumed");
+                eprintln!("[CAL] jitter_window expired — NZ counting resumed");
             }
             nz += 1; prev = Some(idle_ms); ai = 0;
             if nz >= cal.nz_curr {
