@@ -19,6 +19,7 @@ import VideoItem from "./VideoItem";
 import DropZone from "./DropZone";
 import ItemEditor from "./ItemEditor";
 import GlobalSettingsPanel from "./GlobalSettings";
+import AddProgress from "./AddProgress";
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const { invoke: tauriInvoke } = await import("@tauri-apps/api/core");
@@ -336,6 +337,7 @@ export default function LoopManager() {
 
       <ItemEditor />
       {showGlobalSettings && <GlobalSettingsPanel />}
+      <AddProgress />
     </div>
   );
 }

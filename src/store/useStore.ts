@@ -17,6 +17,7 @@ interface AppState {
   idleRemaining: number;
   thumbnailCache: Record<string, string>;
   selectedIds: string[];
+  addProgress: { current: number; total: number } | null;
   loadConfig: () => Promise<void>;
   setEditingItem: (item: VideoItem | null) => void;
   setShowGlobalSettings: (show: boolean) => void;
@@ -60,6 +61,7 @@ export const useStore = create<AppState>((set, get) => ({
   idleRemaining: 120,
   thumbnailCache: {},
   selectedIds: [],
+  addProgress: null,
 
   loadConfig: async () => {
     try {
@@ -75,6 +77,14 @@ export const useStore = create<AppState>((set, get) => ({
       listen<{ remaining: number }>("idle-status", (event) => {
         console.log("idle-status received:", event.payload.remaining);
         set({ idleRemaining: event.payload.remaining });
+      });
+      listen<{ current: number; total: number }>("add-progress", (event) => {
+        const p = event.payload;
+        if (p.current >= p.total) {
+          set({ addProgress: null });
+        } else {
+          set({ addProgress: p });
+        }
       });
     } catch (e) {
       console.error("Failed to load config", e);

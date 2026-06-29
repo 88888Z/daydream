@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{Emitter, State};
 
 #[derive(Debug, Snafu)]
 pub enum ConfigError {
@@ -140,27 +140,36 @@ pub fn update_global_settings(
 }
 
 #[tauri::command]
-pub fn add_videos(state: State<ConfigState>, paths: Vec<String>) -> Result<Vec<VideoItem>, String> {
-    let items: Vec<VideoItem> = paths
-        .into_iter()
-        .map(|path| {
-            let filename = std::path::Path::new(&path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            VideoItem {
-                id: uuid::Uuid::new_v4().to_string(),
-                path,
-                filename,
-                local: None,
-            }
-        })
-        .collect();
+pub fn add_videos(app: tauri::AppHandle, state: State<ConfigState>, paths: Vec<String>) -> Result<Vec<VideoItem>, String> {
+    let total = paths.len();
+    let mut items = Vec::with_capacity(total);
+
+    for (i, path) in paths.into_iter().enumerate() {
+        let filename = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        items.push(VideoItem {
+            id: uuid::Uuid::new_v4().to_string(),
+            path,
+            filename,
+            local: None,
+        });
+        let _ = app.emit("add-progress", serde_json::json!({
+            "current": i + 1,
+            "total": total,
+        }));
+    }
 
     let cloned = items.clone();
     let mut config = state.config.lock().unwrap();
     config.videos.extend(items);
     state.save(&config).map_err(|e| e.to_string())?;
+
+    let _ = app.emit("add-progress", serde_json::json!({
+        "current": total,
+        "total": total,
+    }));
     Ok(cloned)
 }
 
