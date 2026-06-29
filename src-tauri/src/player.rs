@@ -174,10 +174,20 @@ impl MpvPlayer {
                                     }
                                 }
 
-                                // === playback-restart: set transition flag, apply speed/volume, emit now-playing ===
+                                // === playback-restart: set transition flag, measure startup, apply speed/volume, emit now-playing ===
                                 if event_name == "playback-restart" {
                                     crate::MPV_JUST_TRANSITIONED.store(true, std::sync::atomic::Ordering::SeqCst);
                                     crate::LAST_MPV_TRANSITION_MS.store(now_ms as i64, std::sync::atomic::Ordering::SeqCst);
+                                    crate::LAST_TRANSITION_AT.store(now_ms as i64, std::sync::atomic::Ordering::Release);
+                                    // Measure mpv startup delay (playback-restart is the first event that tells us mpv is ready)
+                                    let started = crate::MPV_STARTED_AT.load(std::sync::atomic::Ordering::Acquire);
+                                    if started > 0 {
+                                        let elapsed = (now_ms as i64) - started;
+                                        if elapsed > 0 && elapsed < 30000 {
+                                            crate::LAST_STARTUP_MS.store(elapsed, std::sync::atomic::Ordering::Release);
+                                            eprintln!("[CAL] mpv_startup={}ms now={} started={}", elapsed, now_ms, started);
+                                        }
+                                    }
 
                                     let eid = last_entry_id.unwrap_or(1);
                                     let idx = (eid as usize).saturating_sub(1);

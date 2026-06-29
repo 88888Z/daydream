@@ -14,14 +14,30 @@ pub enum IdleError {
 pub struct IdleDetector;
 
 impl IdleDetector {
+    /// Try every available detection method and return the highest (most conservative) value.
+    /// Logs every individual reading so we can see which method drove each decision.
     pub fn idle_ms() -> Result<u64, IdleError> {
-        if let Ok(ms) = Self::via_xprintidle() {
-            return Ok(ms);
+        let xi = Self::via_xprintidle();
+        let mu = Self::via_gnome_mutter();
+
+        let mut best: Option<u64> = None;
+        let mut parts: Vec<String> = Vec::new();
+
+        if let Ok(ms) = xi {
+            parts.push(format!("xp={}", ms));
+            best = best.map(|b| b.max(ms)).or(Some(ms));
         }
-        if let Ok(ms) = Self::via_gnome_mutter() {
-            return Ok(ms);
+        if let Ok(ms) = mu {
+            parts.push(format!("mu={}", ms));
+            best = best.map(|b| b.max(ms)).or(Some(ms));
         }
-        Err(IdleError::NoMethod)
+
+        if let Some(ms) = best {
+            eprintln!("[idle] {} → {}ms", parts.join(" "), ms);
+            Ok(ms)
+        } else {
+            Err(IdleError::NoMethod)
+        }
     }
 
     fn via_xprintidle() -> Result<u64, IdleError> {

@@ -17,6 +17,9 @@ pub static IS_PLAYING: AtomicBool = AtomicBool::new(false);
 pub static LAST_PLAYED_ENTRY_MS: AtomicI64 = AtomicI64::new(-1);
 pub static MPV_JUST_TRANSITIONED: AtomicBool = AtomicBool::new(false);
 pub static LAST_MPV_TRANSITION_MS: AtomicI64 = AtomicI64::new(0);
+pub static MPV_STARTED_AT: AtomicI64 = AtomicI64::new(0);
+pub static LAST_STARTUP_MS: AtomicI64 = AtomicI64::new(-1);
+pub static LAST_TRANSITION_AT: AtomicI64 = AtomicI64::new(0);
 
 #[tauri::command]
 fn start_idle_monitor(app: AppHandle) {
@@ -67,6 +70,11 @@ fn manual_play(app: AppHandle, state: tauri::State<ConfigState>,
         found.into_iter().min()
     };
 
+    let started_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    MPV_STARTED_AT.store(started_now, Ordering::Release);
     IS_PLAYING.store(true, Ordering::SeqCst);
     start_playback(&app, &videos, &global, rotate_to).map_err(|e| e.to_string())?;
     let _ = app.emit("playback-started", ());
@@ -103,6 +111,8 @@ struct Cal {
     last_stop: Option<std::time::Instant>,
     jitter_start: Option<std::time::Instant>,
     cycles: u64,
+    startup_ms: VecDeque<u64>,
+    startup_window_ms: u64,
 }
 
 impl Cal {
@@ -113,6 +123,7 @@ impl Cal {
             jitter_drops: VecDeque::new(), jitter_rec_ms: VecDeque::new(),
             detect_avg_us: 0, detect_n: 0, tick_avg_us: 0, tick_n: 0,
             last_stop: None, jitter_start: None, cycles: 0,
+            startup_ms: VecDeque::new(), startup_window_ms: 0,
         }
     }
 
@@ -126,6 +137,69 @@ impl Cal {
     }
 
     fn calibrate_nz(&mut self) { self.nz_target = (2000u64 / self.poll_ms).max(3); }
+
+    fn record_startup(&mut self, ms: u64) {
+        self.startup_ms.push_back(ms);
+        if self.startup_ms.len() > 10 { self.startup_ms.pop_front(); }
+        self.calibrate_startup_window();
+        eprintln!("[CAL] startup={}ms n={} window={}ms", ms, self.startup_ms.len(), self.startup_window_ms);
+    }
+
+    fn calibrate_startup_window(&mut self) {
+        let n = self.startup_ms.len();
+        if n == 0 {
+            self.startup_window_ms = 0;
+            return;
+        }
+        let mean = avg(self.startup_ms.iter().copied());
+        if n == 1 {
+            self.startup_window_ms = mean + 3000;
+            eprintln!("[CAL] startup_win={}ms (single sample {}ms + 3000)", self.startup_window_ms, mean);
+            return;
+        }
+        let variance = avg(self.startup_ms.iter().map(|&x| x.abs_diff(mean).pow(2)));
+        let sd = (variance as f64).sqrt() as u64;
+        let margin = (mean as f64 * 0.15) as u64; // 15% safety margin
+        let new = mean + sd * 3 + margin;
+        if new.abs_diff(self.startup_window_ms) > 100 || n <= 2 {
+            eprintln!("[CAL] startup_win mean={} sd={} margin={} {}→{}ms (n={})",
+                mean, sd, margin, self.startup_window_ms, new, n);
+            self.startup_window_ms = new;
+        }
+    }
+
+    fn within_startup(&self) -> bool {
+        let started = MPV_STARTED_AT.load(std::sync::atomic::Ordering::Acquire);
+        if started == 0 { return false; }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let elapsed = now - started;
+        let win = if self.startup_window_ms > 0 { self.startup_window_ms } else { 5000 };
+        let inside = elapsed >= 0 && elapsed < win as i64;
+        if !inside && self.startup_window_ms == 0 && elapsed > 0 {
+            eprintln!("[CAL] startup_win first-guess {}ms (uncalibrated) elapsed={}ms", win, elapsed);
+        }
+        if inside && elapsed % 1000 < 20 { eprintln!("[CAL] within_startup elapsed={}ms win={}ms", elapsed, win); }
+        inside
+    }
+
+    fn within_trans_grace(&self) -> bool {
+        let ts = LAST_TRANSITION_AT.load(std::sync::atomic::Ordering::Acquire);
+        if ts == 0 { return false; }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let elapsed = now - ts;
+        let grace_ms = self.jitter_window_ms.max(5000);
+        let inside = elapsed >= 0 && elapsed < grace_ms as i64;
+        if inside && elapsed % 2000 < 20 {
+            eprintln!("[CAL] trans_grace {}ms win={}ms", elapsed, grace_ms);
+        }
+        inside
+    }
 
     fn calibrate_win(&mut self) {
         let r = avg(self.jitter_rec_ms.iter().copied());
@@ -227,10 +301,13 @@ fn idle_monitor_loop(app: AppHandle) {
         let videos = config.videos.clone();
         let gp = config.global.default_params.clone();
         let lpc = config.global.last_played_entry;
-        let playing = IS_PLAYING.load(Ordering::SeqCst);
-        drop(config);
+            let playing = IS_PLAYING.load(Ordering::SeqCst);
+            // Feed any new mpv startup measurement into calibration
+            let startup_ms = LAST_STARTUP_MS.swap(-1, Ordering::AcqRel);
+            if startup_ms >= 0 { cal.record_startup(startup_ms as u64); }
+            drop(config);
 
-        if !enabled || videos.is_empty() {
+            if !enabled || videos.is_empty() {
             prev = None; ai = 0; nz = 0; steady = false; ac = false; hp = 0; cd = 0;
             continue;
         }
@@ -254,7 +331,7 @@ fn idle_monitor_loop(app: AppHandle) {
         let _ = app.emit("idle-status", serde_json::json!({ "remaining": rem }));
 
         // record jitter for calibration (big drops without mpv, but not user — just observing)
-        if det && !mpv && playing {
+        if det && !mpv && playing && !cal.within_startup() {
             let h: Vec<String> = hist.iter().enumerate().map(|(i, &v)| format!("{}:{}", i, v)).collect();
             cd += 1;
             let now = std::time::Instant::now();
@@ -279,6 +356,8 @@ fn idle_monitor_loop(app: AppHandle) {
         if playing && s < 1 && !mpv {
             if !steady { prev = Some(idle_ms); ai = 0; continue; }
             if ac { ac = false; prev = Some(idle_ms); ai = 0; continue; }
+            if cal.within_startup() { prev = Some(idle_ms); ai = 0; continue; }
+            if cal.within_trans_grace() { prev = Some(idle_ms); ai = 0; continue; }
             if let Some(until) = jitter_until {
                 if std::time::Instant::now() < until {
                     prev = Some(idle_ms); ai = 0; continue;
@@ -291,7 +370,7 @@ fn idle_monitor_loop(app: AppHandle) {
             nz += 1; prev = Some(idle_ms); ai = 0;
             if nz >= effective_nz {
                 cal.record_stop(timeout);
-                eprintln!("[idle] NZ-STOP idle={}ms nz={}/{} nz_target={}", idle_ms, nz, effective_nz, cal.nz_target);
+                eprintln!("[idle] NZ-STOP idle={}ms nz={}/{} nz_target={} startup_win={}ms poll={}ms", idle_ms, nz, effective_nz, cal.nz_target, cal.startup_window_ms, cal.poll_ms);
                 nz = 0; ac = false; post_jitter = false;
                 IS_PLAYING.store(false, Ordering::SeqCst);
                 let _ = app.emit("playback-stopped", ());
@@ -307,7 +386,12 @@ fn idle_monitor_loop(app: AppHandle) {
             if ai == 0 && !playing { eprintln!("[idle] climbing r={}s idle={}ms", rem, idle_ms); }
             ai += 1;
             if ai >= 2 && autoplay && !playing {
-                eprintln!("[idle] AUTOPLAY videos={} rotate={:?}", videos.len(), lpc);
+                let started_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                MPV_STARTED_AT.store(started_now, Ordering::Release);
+                eprintln!("[idle] AUTOPLAY videos={} rotate={:?} started_at={}", videos.len(), lpc, started_now);
                 IS_PLAYING.store(true, Ordering::SeqCst);
                 let _ = app.emit("playback-started", ());
                 let ac2 = app.clone(); let v2 = videos.clone(); let p2 = gp.clone();
@@ -342,6 +426,8 @@ fn start_playback(app: &AppHandle, videos: &[config::VideoItem], global: &config
 fn stop_playback(app: &AppHandle) {
     let _t = std::time::Instant::now();
     LAST_MPV_TRANSITION_MS.store(0, Ordering::SeqCst);
+    LAST_TRANSITION_AT.store(0, Ordering::Release);
+    MPV_STARTED_AT.store(0, Ordering::Release);
     let entry = LAST_PLAYED_ENTRY_MS.load(Ordering::SeqCst);
     if entry >= 0 {
         let state = app.state::<ConfigState>();
