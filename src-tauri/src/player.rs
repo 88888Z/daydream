@@ -255,19 +255,15 @@ impl MpvPlayer {
                     );
                     reader_spawned = true;
                 }
-                std::thread::sleep(Duration::from_millis(100));
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(10));
         }
         let reader_us = _reader_t.elapsed().as_micros();
         if !reader_spawned {
             self.stop();
             return Err(PlayerError::SocketTimeout);
         }
-
-        // Small extra wait for reader to be ready for events
-        std::thread::sleep(Duration::from_millis(200));
 
         // Send baseline now-playing with correct item/entry
         let baseline_item = rotate_to.unwrap_or(0);
@@ -351,7 +347,6 @@ impl MpvPlayer {
             let _ = child.kill();
             let _ = child.wait();
         }
-        std::thread::sleep(Duration::from_millis(100));
         let _ = std::fs::remove_file(PathBuf::from(MPV_SOCKET));
         eprintln!("[TIMING] mpv_stop {}us", _t.elapsed().as_micros());
     }

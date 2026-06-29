@@ -221,9 +221,14 @@ fn idle_monitor_loop(app: AppHandle) {
                 eprintln!("[idle] AUTOPLAY videos={} rotate={:?}", videos.len(), last_played_from_config);
                 IS_PLAYING.store(true, Ordering::SeqCst);
                 let _ = app.emit("playback-started", ());
-                if let Err(e) = start_playback(&app, &videos, &global_params, last_played_from_config) {
-                    eprintln!("[idle] autoplay failed: {e}");
-                }
+                let app_clone = app.clone();
+                let v = videos.clone();
+                let p = global_params.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = start_playback(&app_clone, &v, &p, last_played_from_config) {
+                        eprintln!("[idle] autoplay failed: {e}");
+                    }
+                });
             }
         } else {
             consec_idle_for_autoplay = 0;
