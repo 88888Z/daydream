@@ -149,7 +149,7 @@ impl MpvPlayer {
                     match line {
                         Ok(json) => {
                             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&json) {
-                                let event_name = obj.get("event").and_then(|e| e.as_str()).unwrap_or("unknown");
+                                let event_name = obj.get("event").and_then(|e| e.as_str()).unwrap_or("");
                                 if event_name == "playback-restart" || event_name == "start-file" {
                                     eprintln!("[daydream-player] RAW EVENT {}: {}", event_name, json);
                                 }
@@ -273,11 +273,12 @@ impl MpvPlayer {
             "totalEntries": total_items,
         }));
 
-        // Set speed/volume for first item (non-critical, can fail)
+        // Set speed/volume for first item
         if let Some(first) = items.first() {
             let params = first.local.as_ref().unwrap_or(global);
-            let _ = self.send_json(&serde_json::json!(["set", "speed", params.speed]));
-            let _ = self.send_json(&serde_json::json!(["set", "volume", params.volume]));
+            eprintln!("[daydream-player] set speed={} volume={} for first item {}", params.speed, params.volume, first.filename);
+            let _ = self.send_json(&serde_json::json!({"command": ["set_property", "speed", params.speed]}));
+            let _ = self.send_json(&serde_json::json!({"command": ["set_property", "volume", params.volume]}));
         }
 
         let child_for_monitor = self.child.lock().unwrap().take();
