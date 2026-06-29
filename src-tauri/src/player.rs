@@ -85,8 +85,10 @@ impl MpvPlayer {
             "--loop-playlist=inf".into(),
         ];
         if let Some(entry) = rotate_to_entry {
-            eprintln!("[daydream] --playlist-start={entry}");
+            eprintln!("[daydream] --playlist-start={} (expanded_paths_count={})", entry, expanded_paths.len());
             args.push(format!("--playlist-start={entry}"));
+        } else {
+            eprintln!("[daydream] no --playlist-start (rotate_to_entry=None, expanded_paths_count={})", expanded_paths.len());
         }
         for p in expanded_paths.iter() {
             args.push(p.clone());
@@ -131,6 +133,7 @@ impl MpvPlayer {
 
             if let Some(stream) = stream {
                 let reader = BufReader::new(stream);
+                let mut last_entry_id: Option<u64> = None;
                 for line in reader.lines() {
                     if stop_signal.load(Ordering::SeqCst) {
                         break;
@@ -138,19 +141,48 @@ impl MpvPlayer {
                     match line {
                         Ok(json) => {
                             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&json) {
-                                if obj.get("event").and_then(|e| e.as_str()) == Some("playback-restart") {
-                                    crate::MPV_JUST_TRANSITIONED.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    eprintln!("[daydream-player] playback-restart — set MPV_JUST_TRANSITIONED=true");
-                                    if let Some(entry_id) = obj.get("playlist_entry_id").and_then(|e| e.as_u64()) {
-                                        let idx = (entry_id as usize).saturating_sub(1);
+                                let event_name = obj.get("event").and_then(|e| e.as_str()).unwrap_or("unknown");
+                                if event_name == "playback-restart" || event_name == "start-file" {
+                                    eprintln!("[daydream-player] RAW EVENT {}: {}", event_name, json);
+                                }
+
+                                // === start-file: carries playlist_entry_id, store immediately ===
+                                if event_name == "start-file" {
+                                    last_entry_id = obj.get("playlist_entry_id").and_then(|e| e.as_u64());
+                                    if let Some(eid) = last_entry_id {
+                                        let idx = (eid as usize).saturating_sub(1);
+                                        eprintln!("[daydream-player] start-file entry_id={} idx={} entry_to_item={:?}",
+                                            eid, idx, entry_to_item);
+                                        crate::LAST_PLAYED_ENTRY_MS.store(idx as i64, std::sync::atomic::Ordering::SeqCst);
                                         if let Some(&item_idx) = entry_to_item.get(idx) {
-                                            crate::LAST_PLAYED_ENTRY_MS.store(idx as i64, std::sync::atomic::Ordering::SeqCst);
                                             let _ = app.emit("now-playing", serde_json::json!({
                                                 "itemIndex": item_idx,
                                                 "entryIndex": idx,
                                                 "totalEntries": total_items,
                                             }));
+                                        } else {
+                                            eprintln!("[daydream-player] start-file WARNING entry_to_item.get({}) None", idx);
                                         }
+                                    }
+                                }
+
+                                // === playback-restart: set transition flag, also store using cached entry_id ===
+                                if event_name == "playback-restart" {
+                                    crate::MPV_JUST_TRANSITIONED.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    eprintln!("[daydream-player] playback-restart — set MPV_JUST_TRANSITIONED=true");
+
+                                    let eid = last_entry_id.unwrap_or(1);
+                                    let idx = (eid as usize).saturating_sub(1);
+                                    eprintln!("[daydream-player] playback-restart using entry_id={:?} idx={}", last_entry_id, idx);
+                                    crate::LAST_PLAYED_ENTRY_MS.store(idx as i64, std::sync::atomic::Ordering::SeqCst);
+                                    if let Some(&item_idx) = entry_to_item.get(idx) {
+                                        let _ = app.emit("now-playing", serde_json::json!({
+                                            "itemIndex": item_idx,
+                                            "entryIndex": idx,
+                                            "totalEntries": total_items,
+                                        }));
+                                    } else {
+                                        eprintln!("[daydream-player] playback-restart WARNING entry_to_item.get({}) None", idx);
                                     }
                                 }
                             }
@@ -183,7 +215,12 @@ impl MpvPlayer {
         let rotate_to_entry = rotate_to
             .and_then(|item_idx| {
                 let pos = entry_to_item.iter().position(|&i| i == item_idx);
-                eprintln!("[daydream] rotate_to item={item_idx} entry_to_item={entry_to_item:?} -> entry={pos:?}");
+                eprintln!("[daydream] RESOLVE rotate_to item_idx={} entry_to_item={:?} total_items={} -> entry_idx={:?}",
+                    item_idx, entry_to_item, total_items, pos);
+                if pos.is_none() {
+                    eprintln!("[daydream] RESOLVE FAILURE item_idx={} NOT FOUND in entry_to_item (len={}) — will restart from beginning",
+                        item_idx, entry_to_item.len());
+                }
                 pos
             });
 

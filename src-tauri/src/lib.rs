@@ -99,7 +99,10 @@ fn idle_monitor_loop(app: AppHandle) {
         let should_autoplay = config.global.autoplay_on_idle;
         let videos = config.videos.clone();
         let global_params = config.global.default_params.clone();
+        let last_played_from_config = config.global.last_played_entry;
         let is_playing = IS_PLAYING.load(Ordering::SeqCst);
+        eprintln!("[daydream-idle] config loaded: last_played_from_config={:?} timeout={} enabled={} autoplay={} videos={}",
+            last_played_from_config, timeout, enabled, should_autoplay, videos.len());
         drop(config);
 
         if !enabled || videos.is_empty() {
@@ -218,10 +221,11 @@ fn idle_monitor_loop(app: AppHandle) {
             after_climb = false;
             consec_idle_for_autoplay += 1;
             if consec_idle_for_autoplay >= 2 && should_autoplay && !is_playing {
-                eprintln!("[daydream-idle] AUTOPLAY starting idle playback");
+                eprintln!("[daydream-idle] AUTOPLAY last_played_from_config={:?} — calling start_playback with rotate_to={:?}",
+                    last_played_from_config, last_played_from_config);
                 IS_PLAYING.store(true, Ordering::SeqCst);
                 let _ = app.emit("playback-started", ());
-                if let Err(e) = start_playback(&app, &videos, &global_params, None) {
+                if let Err(e) = start_playback(&app, &videos, &global_params, last_played_from_config) {
                     eprintln!("[daydream-idle] autoplay failed: {e}");
                 }
             }
@@ -246,11 +250,12 @@ fn start_playback(app: &AppHandle, videos: &[config::VideoItem], global: &config
 
 fn stop_playback(app: &AppHandle) {
     let entry = LAST_PLAYED_ENTRY_MS.load(Ordering::SeqCst);
-    eprintln!("[daydream] stop_playback: last_played_entry={}", entry);
+    eprintln!("[daydream] stop_playback: LAST_PLAYED_ENTRY_MS={} will be saved to config", entry);
     if entry >= 0 {
         let state = app.state::<ConfigState>();
         let mut config = state.config.lock().unwrap();
         config.global.last_played_entry = Some(entry as usize);
+        eprintln!("[daydream] stop_playback: saving last_played_entry={:?} to config.json", config.global.last_played_entry);
         let _ = state.save(&config);
     }
     let player = app.state::<MpvPlayer>();
