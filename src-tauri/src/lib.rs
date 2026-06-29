@@ -209,6 +209,7 @@ fn idle_monitor_loop(app: AppHandle) {
     let mut ac: bool = false;
     let mut cd: u64 = 0;
     let mut jitter_until: Option<std::time::Instant> = None;
+    let mut post_jitter: bool = false;
     let mut cal = Cal::new();
     let mut hist: [u64; 10] = [0; 10];
     let mut hp: usize = 0;
@@ -283,13 +284,15 @@ fn idle_monitor_loop(app: AppHandle) {
                     prev = Some(idle_ms); ai = 0; continue;
                 }
                 jitter_until = None;
-                eprintln!("[CAL] jitter_window expired — NZ counting resumed");
+                post_jitter = true;
+                eprintln!("[CAL] jitter_win_expired fast_nz={}", (1000 / cal.poll_ms).max(2));
             }
+            let effective_nz = if post_jitter { (1000 / cal.poll_ms).max(2) } else { cal.nz_target };
             nz += 1; prev = Some(idle_ms); ai = 0;
-            if nz >= cal.nz_target {
+            if nz >= effective_nz {
                 cal.record_stop(timeout);
-                eprintln!("[idle] NZ-STOP idle={}ms nz={}/{} nz_target={}", idle_ms, nz, cal.nz_target, cal.nz_target);
-                nz = 0; ac = false;
+                eprintln!("[idle] NZ-STOP idle={}ms nz={}/{} nz_target={}", idle_ms, nz, effective_nz, cal.nz_target);
+                nz = 0; ac = false; post_jitter = false;
                 IS_PLAYING.store(false, Ordering::SeqCst);
                 let _ = app.emit("playback-stopped", ());
                 stop_playback(&app);
@@ -297,7 +300,7 @@ fn idle_monitor_loop(app: AppHandle) {
             continue;
         }
 
-        nz = 0; jitter_until = None; prev = Some(idle_ms);
+        nz = 0; jitter_until = None; post_jitter = false; prev = Some(idle_ms);
 
         if s >= timeout {
             ac = false;
