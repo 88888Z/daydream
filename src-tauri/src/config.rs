@@ -130,15 +130,9 @@ impl ConfigState {
     }
 }
 
-macro_rules! timing { ($name:expr, $start:expr) => {
-    eprintln!("[TIMING] {} {}us", $name, $start.elapsed().as_micros());
-}; }
-
 #[tauri::command]
 pub fn get_config(state: State<ConfigState>) -> Result<AppConfig, String> {
-    let _t = std::time::Instant::now();
     let config = state.config.lock().unwrap().clone();
-    timing!("get_config", _t);
     Ok(config)
 }
 
@@ -147,11 +141,9 @@ pub fn update_global_settings(
     state: State<ConfigState>,
     settings: GlobalSettings,
 ) -> Result<(), String> {
-    let _t = std::time::Instant::now();
     let mut config = state.config.lock().unwrap();
     config.global = settings;
     state.save(&config).map_err(|e| e.to_string())?;
-    timing!("update_global_settings", _t);
     Ok(())
 }
 
@@ -167,7 +159,7 @@ pub fn add_videos(app: tauri::AppHandle, state: State<ConfigState>, paths: Vec<S
     drop(config);
 
     if new_paths.is_empty() {
-        timing!("add_videos", _t);
+        eprintln!("[TIMING] add_videos {}us added=0 dup={}", _t.elapsed().as_micros(), duplicates);
         return Ok(AddVideosResult { items: vec![], added: 0, duplicates });
     }
 
@@ -198,33 +190,29 @@ pub fn add_videos(app: tauri::AppHandle, state: State<ConfigState>, paths: Vec<S
         "current": total,
         "total": total,
     }));
-    timing!("add_videos", _t);
+    eprintln!("[TIMING] add_videos {}us added={} dup={} total={}", _t.elapsed().as_micros(), added, duplicates, total);
     Ok(AddVideosResult { items: cloned, added, duplicates })
 }
 
 #[tauri::command]
 pub fn remove_video(state: State<ConfigState>, id: String) -> Result<(), String> {
-    let _t = std::time::Instant::now();
     let mut config = state.config.lock().unwrap();
     config.videos.retain(|v| v.id != id);
     state.save(&config).map_err(|e| e.to_string())?;
-    timing!("remove_video", _t);
     Ok(())
 }
 
 #[tauri::command]
 pub fn reorder_videos(state: State<ConfigState>, ids: Vec<String>) -> Result<(), String> {
-    let _t = std::time::Instant::now();
     let mut config = state.config.lock().unwrap();
     let mut ordered = Vec::with_capacity(ids.len());
-    for (pos, id) in ids.iter().enumerate() {
+    for id in &ids {
         if let Some(item) = config.videos.iter().find(|v| &v.id == id) {
             ordered.push(item.clone());
         }
     }
     config.videos = ordered;
     state.save(&config).map_err(|e| e.to_string())?;
-    timing!("reorder_videos", _t);
     Ok(())
 }
 
@@ -234,12 +222,10 @@ pub fn update_video_params(
     id: String,
     params: Option<VideoParams>,
 ) -> Result<(), String> {
-    let _t = std::time::Instant::now();
     let mut config = state.config.lock().unwrap();
     if let Some(item) = config.videos.iter_mut().find(|v| v.id == id) {
         item.local = params;
     }
     state.save(&config).map_err(|e| e.to_string())?;
-    timing!("update_video_params", _t);
     Ok(())
 }

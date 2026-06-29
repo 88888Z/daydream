@@ -228,10 +228,7 @@ impl MpvPlayer {
 
         let rotate_to_entry = rotate_to
             .and_then(|item_idx| {
-                let _r_t = std::time::Instant::now();
-                let pos = entry_to_item.iter().position(|&i| i == item_idx);
-                eprintln!("[TIMING] resolve_rotate {}us item_idx={} pos={:?}", _r_t.elapsed().as_micros(), item_idx, pos);
-                pos
+                entry_to_item.iter().position(|&i| i == item_idx)
             });
 
         let _spawn_t = std::time::Instant::now();
@@ -331,7 +328,6 @@ impl MpvPlayer {
     }
 
     fn send_cmd(cmd: &serde_json::Value) -> Result<(), PlayerError> {
-        let _t = std::time::Instant::now();
         let socket_path = PathBuf::from(MPV_SOCKET);
         if !socket_path.exists() {
             return Err(PlayerError::NotRunning);
@@ -343,7 +339,6 @@ impl MpvPlayer {
         })?;
         stream.write_all(&data).map_err(|e| PlayerError::Command { source: e })?;
         stream.write_all(b"\n").map_err(|e| PlayerError::Command { source: e })?;
-        eprintln!("[TIMING] send_cmd {}us", _t.elapsed().as_micros());
         Ok(())
     }
 

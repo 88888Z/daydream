@@ -93,36 +93,21 @@ fn idle_monitor_loop(app: AppHandle) {
     let mut after_climb: bool = false;
 
     while IDLE_MONITOR_ACTIVE.load(Ordering::SeqCst) {
-        let tick_start = std::time::Instant::now();
+        let _tick_start = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let sleep_done = std::time::Instant::now();
-        let sleep_overhead = sleep_done.duration_since(tick_start).as_micros().saturating_sub(1_000_000);
 
-        let t_lock = std::time::Instant::now();
         let state = app.state::<ConfigState>();
         let config = state.config.lock().unwrap();
         let timeout = config.global.idle_timeout_seconds;
         let enabled = config.global.idle_enabled;
         let should_autoplay = config.global.autoplay_on_idle;
-        let t_clone_start = std::time::Instant::now();
         let videos = config.videos.clone();
         let global_params = config.global.default_params.clone();
         let last_played_from_config = config.global.last_played_entry;
         let is_playing = IS_PLAYING.load(Ordering::SeqCst);
-        let t_log_start = std::time::Instant::now();
-        eprintln!("[daydream-idle] config loaded: last_played_from_config={:?} timeout={} enabled={} autoplay={} videos={}",
-            last_played_from_config, timeout, enabled, should_autoplay, videos.len());
         drop(config);
-        let t_timing_log = std::time::Instant::now();
-        let lock_us = t_clone_start.duration_since(t_lock).as_micros();
-        let clone_us = t_log_start.duration_since(t_clone_start).as_micros();
-        let log_drop_us = t_timing_log.duration_since(t_log_start).as_micros();
-        eprintln!("[daydream-idle] TIMING sleep_overhead={}us lock={}us clone={}us log_drop={}us total_pre_idle={}us",
-            sleep_overhead, lock_us, clone_us, log_drop_us,
-            t_timing_log.duration_since(t_lock).as_micros());
 
         if !enabled || videos.is_empty() {
-            eprintln!("[daydream-idle] idle disabled or no videos — resetting state");
             previous_idle = None;
             consec_idle_for_autoplay = 0;
             near_zero_count = 0;
@@ -132,15 +117,10 @@ fn idle_monitor_loop(app: AppHandle) {
             continue;
         }
 
-        let idle_detect_start = std::time::Instant::now();
         let idle_ms = match idle::IdleDetector::idle_ms() {
-            Ok(ms) => {
-                let idle_us = idle_detect_start.elapsed().as_micros();
-                eprintln!("[daydream-idle] TIMING idle_ms={}us result={}ms", idle_us, ms);
-                ms
-            },
+            Ok(ms) => ms,
             Err(e) => {
-                eprintln!("[daydream-idle] idle detection error: {e} — resetting state");
+                eprintln!("[idle] detect error: {e} — resetting");
                 previous_idle = None;
                 consec_idle_for_autoplay = 0;
                 near_zero_count = 0;
@@ -150,10 +130,8 @@ fn idle_monitor_loop(app: AppHandle) {
                 continue;
             }
         };
-        let post_idle = std::time::Instant::now();
 
         let idle_secs = idle_ms / 1000;
-
         let prev = previous_idle;
         let detected_interaction = prev
             .map(|p| p.saturating_sub(idle_ms) > 2000)
@@ -166,23 +144,17 @@ fn idle_monitor_loop(app: AppHandle) {
 
         if !steady_seen && idle_high_enough {
             steady_seen = true;
-            eprintln!("[daydream-idle] STEADY idle_secs={} >= timeout={} — timer verified, nz counting enabled", idle_secs, timeout);
+            eprintln!("[idle] steady idle_secs={} >= timeout={}", idle_secs, timeout);
         }
 
         let remaining = timeout.saturating_sub(idle_secs.min(timeout));
-        let t_tick_log = std::time::Instant::now();
-        eprintln!("[daydream-idle] tick idle_ms={} idle_secs={} prev={:?} remaining={} timeout={} is_playing={} detected={} mpv_flag={} near_zero={} climbing={} steady={} nz_count={} after_climb={} consec_idle={} suppressed={}",
-            idle_ms, idle_secs, prev, remaining, timeout, is_playing, detected_interaction, mpv_flag, near_zero, timer_climbing, steady_seen, near_zero_count, after_climb, consec_idle_for_autoplay, suppressed_count);
-        let t_emit = std::time::Instant::now();
+        eprintln!("[idle] tick t={}ms prev={:?} r={}s play={} det={} mpv={} nz={} cl={} st={} nz#={} ac={} ai={} sup={}",
+            idle_ms, prev, remaining, is_playing as u8, detected_interaction as u8, mpv_flag as u8,
+            near_zero as u8, timer_climbing as u8, steady_seen as u8, near_zero_count, after_climb as u8,
+            consec_idle_for_autoplay, suppressed_count);
         let _ = app.emit("idle-status", serde_json::json!({ "remaining": remaining }));
-        let t_post_emit = std::time::Instant::now();
-        let logic_start = std::time::Instant::now();
-        eprintln!("[daydream-idle] TIMING idle_logic={}us tick_log={}us emit={}us",
-            post_idle.duration_since(idle_detect_start).as_micros(),
-            t_emit.duration_since(t_tick_log).as_micros(),
-            t_post_emit.duration_since(t_emit).as_micros());
 
-        // === PATH 0: strong signal — genuine user interaction (no mpv involved) ===
+        // PATH 0: strong signal — real user interaction (no mpv)
         if detected_interaction && !mpv_flag && is_playing {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -190,74 +162,52 @@ fn idle_monitor_loop(app: AppHandle) {
                 .as_millis() as i64;
             let since_last_mpv = now_ms.saturating_sub(LAST_MPV_TRANSITION_MS.load(Ordering::SeqCst));
             if since_last_mpv > 2000 {
-                eprintln!("[daydream-idle] REAL-USER-STOP idle_ms {} ms -> {} ms since_last_mpv={}ms — stopping immediately",
-                    prev.unwrap_or(0), idle_ms, since_last_mpv);
-                near_zero_count = 0;
-                suppressed_count = 0;
-                after_climb = false;
+                eprintln!("[idle] REAL-STOP {}→{}ms mpv_dist={}ms", prev.unwrap_or(0), idle_ms, since_last_mpv);
+                near_zero_count = 0; suppressed_count = 0; after_climb = false;
                 IS_PLAYING.store(false, Ordering::SeqCst);
                 let _ = app.emit("playback-stopped", ());
                 stop_playback(&app);
                 previous_idle = Some(idle_ms);
                 continue;
-            } else {
-                eprintln!("[daydream-idle] NEAR-MPV detected interaction but {}ms < 2000ms since last mpv transition — treating as noise",
-                    since_last_mpv);
             }
         }
 
-        // === PATH 1: mpv transition — known false positive, skip ===
+        // PATH 1: mpv transition
         if detected_interaction && mpv_flag {
             suppressed_count += 1;
-            near_zero_count = 0;
-            after_climb = false;
-            eprintln!("[daydream-idle] SUPPRESS drop {}→{} ms from mpv transition (total={})",
-                prev.unwrap_or(0), idle_ms, suppressed_count);
+            near_zero_count = 0; after_climb = false;
             previous_idle = Some(idle_ms);
             consec_idle_for_autoplay = 0;
             continue;
         }
 
-        // === PATH 2: timer climbing after reset — natural recovery, not user ===
+        // PATH 2: timer climbing
         if is_playing && timer_climbing {
-            near_zero_count = 0;
-            after_climb = true;
-            eprintln!("[daydream-idle] CLIMB idle_secs={} — after_climb→true", idle_secs);
+            near_zero_count = 0; after_climb = true;
             previous_idle = Some(idle_ms);
             consec_idle_for_autoplay = 0;
             continue;
         }
 
-        // === PATH 3: near-zero while playing — only count if sensor proved reliable ===
+        // PATH 3: near-zero while playing
         if is_playing && near_zero && !mpv_flag {
             if !steady_seen {
-                eprintln!("[daydream-idle] UNSTEADY idle_ms={} near_zero but timer NEVER reached timeout={} — NOT counted (sensor may be stuck)",
-                    idle_ms, timeout);
                 previous_idle = Some(idle_ms);
                 consec_idle_for_autoplay = 0;
                 continue;
             }
-
-            // Skip first NEAR-ZERO after a CLIMB (timer spontaneously collapsed from noise)
             if after_climb {
                 after_climb = false;
-                eprintln!("[daydream-idle] POST-CLIMB idle_ms={} after_climb→false — collapse skipped, nz_count stays={}", idle_ms, near_zero_count);
                 previous_idle = Some(idle_ms);
                 consec_idle_for_autoplay = 0;
                 continue;
             }
-
             near_zero_count += 1;
-            eprintln!("[daydream-idle] NEAR-ZERO idle_ms={} steady={} nz_count={}/4",
-                idle_ms, steady_seen, near_zero_count);
             previous_idle = Some(idle_ms);
             consec_idle_for_autoplay = 0;
-
             if near_zero_count >= 4 {
-                near_zero_count = 0;
-                suppressed_count = 0;
-                after_climb = false;
-                eprintln!("[daydream-idle] NEAR-ZERO-STOP idle_ms={} sustained for 4 ticks — stopping playback", idle_ms);
+                eprintln!("[idle] NZ-STOP idle={}ms nz#={}", idle_ms, near_zero_count);
+                near_zero_count = 0; suppressed_count = 0; after_climb = false;
                 IS_PLAYING.store(false, Ordering::SeqCst);
                 let _ = app.emit("playback-stopped", ());
                 stop_playback(&app);
@@ -265,45 +215,33 @@ fn idle_monitor_loop(app: AppHandle) {
             continue;
         }
 
-        // === NONE OF THE ABOVE: just track autoplay ===
+        // passthrough
         near_zero_count = 0;
         previous_idle = Some(idle_ms);
-        eprintln!("[daydream-idle] passthrough idle_secs={} idle_high={} playing={} — nz_count→0 after_climb={}",
-            idle_secs, idle_high_enough, is_playing, after_climb);
 
         if idle_high_enough {
             after_climb = false;
             consec_idle_for_autoplay += 1;
             if consec_idle_for_autoplay >= 2 && should_autoplay && !is_playing {
-                let build_start = std::time::Instant::now();
-                let order_str = videos.iter().enumerate().map(|(i, v)| format!("{}:{}", i, v.filename)).collect::<Vec<_>>();
-                eprintln!("[daydream-idle] TIMING build_order_str {}us for {} videos", build_start.elapsed().as_micros(), videos.len());
-                eprintln!("[daydream-idle] AUTOPLAY last_played_from_config={:?} rotate_to={:?} videos ({}) order: {:?}",
-                    last_played_from_config, last_played_from_config, videos.len(), order_str);
+                eprintln!("[idle] AUTOPLAY videos={} rotate={:?}", videos.len(), last_played_from_config);
                 IS_PLAYING.store(true, Ordering::SeqCst);
                 let _ = app.emit("playback-started", ());
                 if let Err(e) = start_playback(&app, &videos, &global_params, last_played_from_config) {
-                    eprintln!("[daydream-idle] autoplay failed: {e}");
+                    eprintln!("[idle] autoplay failed: {e}");
                 }
             }
         } else {
             consec_idle_for_autoplay = 0;
         }
 
-        let tick_total = tick_start.elapsed();
-        let path_end = std::time::Instant::now();
-        eprintln!("[daydream-idle] TIMING tick_total={}us sleep_over={}us pre_idle={}us idle={}us logic={}us path={}us",
-            tick_total.as_micros(),
-            sleep_overhead,
-            t_timing_log.duration_since(t_lock).as_micros(),
-            idle_detect_start.elapsed().as_micros(),
-            post_idle.duration_since(idle_detect_start).as_micros(),
-            path_end.duration_since(logic_start).as_micros());
+        // Only log slow ticks (>50ms overhead on 200ms sleep)
+        let tick_us = _tick_start.elapsed().as_micros();
+        if tick_us > 250_000 {
+            eprintln!("[TIMING] tick SLOW {}ms ({}us overhead)", tick_us / 1000, tick_us.saturating_sub(200_000));
+        }
     }
 
-    eprintln!("[daydream-idle] monitor loop exiting");
     if IS_PLAYING.load(Ordering::SeqCst) {
-        eprintln!("[daydream-idle] cleanup stopping playback on loop exit");
         IS_PLAYING.store(false, Ordering::SeqCst);
         stop_playback(&app);
     }
