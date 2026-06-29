@@ -104,17 +104,23 @@ impl Cal {
         }
     }
 
-    fn record_tick(&mut self, actual_us: u64) {
-        if self.tick_samples == 0 { self.tick_avg_us = actual_us; }
-        else { self.tick_avg_us = (self.tick_avg_us * self.tick_samples + actual_us) / (self.tick_samples + 1); }
+    fn record_overhead(&mut self, overhead_us: u64) {
+        if self.tick_samples == 0 { self.tick_avg_us = overhead_us; }
+        else { self.tick_avg_us = (self.tick_avg_us * self.tick_samples + overhead_us) / (self.tick_samples + 1); }
         self.tick_samples += 1;
-        if self.tick_samples >= 20 {
-            // calibrate poll: 2x actual tick time, clamped
-            let new_poll = (self.tick_avg_us / 500).max(100).min(500);
-            if new_poll != self.poll_ms {
+        if self.tick_samples >= 5 {
+            // overhead budget: 10% of poll time
+            let target_overhead = self.poll_ms * 100;
+            if self.tick_avg_us > target_overhead && self.poll_ms < 500 {
                 let old = self.poll_ms;
-                self.poll_ms = new_poll;
-                eprintln!("[CAL] poll {}ms→{}ms (tick_avg={}ms samples={})", old, self.poll_ms, self.tick_avg_us / 1000, self.tick_samples);
+                self.poll_ms = (self.poll_ms + 50).min(500);
+                eprintln!("[CAL] overhead {}us > target {}us → poll {}ms→{}ms",
+                    self.tick_avg_us, target_overhead, old, self.poll_ms);
+            } else if self.tick_avg_us < target_overhead / 2 && self.poll_ms > 100 && self.tick_samples > 20 {
+                let old = self.poll_ms;
+                self.poll_ms = (self.poll_ms - 50).max(100);
+                eprintln!("[CAL] overhead {}us < target/2 → poll {}ms→{}ms",
+                    self.tick_avg_us, old, self.poll_ms);
             }
         }
     }
@@ -162,11 +168,12 @@ impl Cal {
 
 fn idle_monitor_loop(app: AppHandle) {
     let mut prev: Option<u64> = None;
-    let mut ai: u64 = 0; // consec_idle_for_autoplay
-    let mut nz: u64 = 0; // near_zero_count
+    let mut ai: u64 = 0;
+    let mut nz: u64 = 0;
     let mut steady: bool = false;
-    let mut ac: bool = false; // after_climb
-    let mut cd: u64 = 0; // consec_detected
+    let mut ac: bool = false;
+    let mut cd: u64 = 0;
+    let mut jz: u64 = 0; // jitter skip counter
     let mut cal = Cal::new();
     let mut hist: [u64; 10] = [0; 10];
     let mut hp: usize = 0;
@@ -174,6 +181,7 @@ fn idle_monitor_loop(app: AppHandle) {
     while IDLE_MONITOR_ACTIVE.load(Ordering::SeqCst) {
         let _ts = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(cal.poll_ms));
+        let _after_sleep = std::time::Instant::now();
 
         let state = app.state::<ConfigState>();
         let config = state.config.lock().unwrap();
@@ -218,6 +226,12 @@ fn idle_monitor_loop(app: AppHandle) {
             if cal.detect_samples > 5 && drop > cal.max_jitter_drop {
                 cal.record_jitter(drop);
             }
+            // Jitter envelope: if drop within known jitter ×1.2, skip NZ for enough ticks
+            if cal.max_jitter_drop > 0 && drop <= cal.max_jitter_drop * 120 / 100 {
+                jz = cal.nz_curr + 4;
+                eprintln!("[CAL] jitter_env drop={}ms max_jitter={}ms → skip NZ for {} ticks",
+                    drop, cal.max_jitter_drop, jz);
+            }
             eprintln!("[idle] DETECT#{}=drop={}ms hist=[{}] prev={:?} curr={}", cd, drop, h.join(","), p, idle_ms);
         } else { cd = 0; }
 
@@ -227,6 +241,11 @@ fn idle_monitor_loop(app: AppHandle) {
         if playing && s < 1 && !mpv {
             if !steady { prev = Some(idle_ms); ai = 0; continue; }
             if ac { ac = false; prev = Some(idle_ms); ai = 0; continue; }
+            if jz > 0 {
+                jz -= 1;
+                if jz == 0 { eprintln!("[CAL] jitter_skip expired — NZ counting resumed"); }
+                prev = Some(idle_ms); ai = 0; continue;
+            }
             nz += 1; prev = Some(idle_ms); ai = 0;
             if nz >= cal.nz_curr {
                 cal.record_stop(timeout);
@@ -239,7 +258,7 @@ fn idle_monitor_loop(app: AppHandle) {
             continue;
         }
 
-        nz = 0; prev = Some(idle_ms);
+        nz = 0; jz = 0; prev = Some(idle_ms);
 
         if s >= timeout {
             ac = false;
@@ -255,12 +274,12 @@ fn idle_monitor_loop(app: AppHandle) {
         } else { ai = 0; }
 
         let tus = _ts.elapsed().as_micros() as u64;
-        cal.record_tick(tus);
-        let poll_us = cal.poll_ms * 1000;
-        if tus > poll_us * 150 / 100 {
-            eprintln!("[TIMING] tick {}ms poll={}ms overhead={}ms p={} nz={} dt={} cyc={}",
-                tus / 1000, cal.poll_ms, tus.saturating_sub(poll_us) / 1000,
-                cal.poll_ms, cal.nz_curr, cal.drop_thresh, cal.cycles);
+        let overhead_us = tus.saturating_sub(cal.poll_ms * 1000);
+        cal.record_overhead(overhead_us);
+        if overhead_us > cal.poll_ms * 500 {
+            eprintln!("[TIMING] tick {}ms poll={}ms overhead={}ms jz={} nz={} dt={} cyc={}",
+                tus / 1000, cal.poll_ms, overhead_us / 1000,
+                jz, cal.nz_curr, cal.drop_thresh, cal.cycles);
         }
     }
 
