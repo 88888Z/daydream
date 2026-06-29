@@ -86,34 +86,36 @@ fn manual_stop(app: AppHandle) -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 struct Cal {
-    // calibrated
-    poll_ms: u64,
-    drop_thresh: u64,
-    // adaptive nz
-    nz_base: u64,
-    nz_curr: u64,
-    nz_max: u64,
-    nz_cooldown_secs: u64,
-    // measured
+    poll_ms: u64, drop_thresh: u64,
+    nz_base: u64, nz_curr: u64, nz_max: u64,
     max_jitter_drop: u64,
-    detect_avg_us: u64,
-    detect_samples: u64,
-    last_stop_at: Option<std::time::Instant>,
-    cycle_speed: u64,
-    // state
-    calibrated: bool,
+    detect_avg_us: u64, detect_samples: u64, tick_avg_us: u64, tick_samples: u64,
+    last_stop_at: Option<std::time::Instant>, cycle_speed: u64, cycles: u64,
 }
 
 impl Cal {
     fn new() -> Self {
         Self {
-            poll_ms: 200,
-            drop_thresh: 2000,
-            nz_base: 4, nz_curr: 4, nz_max: 4, nz_cooldown_secs: 10,
+            poll_ms: 200, drop_thresh: 1500,
+            nz_base: 4, nz_curr: 4, nz_max: 4,
             max_jitter_drop: 0,
-            detect_avg_us: 0, detect_samples: 0,
-            last_stop_at: None, cycle_speed: 0,
-            calibrated: false,
+            detect_avg_us: 0, detect_samples: 0, tick_avg_us: 0, tick_samples: 0,
+            last_stop_at: None, cycle_speed: 0, cycles: 0,
+        }
+    }
+
+    fn record_tick(&mut self, actual_us: u64) {
+        if self.tick_samples == 0 { self.tick_avg_us = actual_us; }
+        else { self.tick_avg_us = (self.tick_avg_us * self.tick_samples + actual_us) / (self.tick_samples + 1); }
+        self.tick_samples += 1;
+        if self.tick_samples >= 20 {
+            // calibrate poll: 2x actual tick time, clamped
+            let new_poll = (self.tick_avg_us / 500).max(100).min(500);
+            if new_poll != self.poll_ms {
+                let old = self.poll_ms;
+                self.poll_ms = new_poll;
+                eprintln!("[CAL] poll {}ms→{}ms (tick_avg={}ms samples={})", old, self.poll_ms, self.tick_avg_us / 1000, self.tick_samples);
+            }
         }
     }
 
@@ -121,20 +123,17 @@ impl Cal {
         if self.detect_samples == 0 { self.detect_avg_us = us; }
         else { self.detect_avg_us = (self.detect_avg_us * self.detect_samples + us) / (self.detect_samples + 1); }
         self.detect_samples += 1;
-        if !self.calibrated && self.detect_samples >= 10 {
-            self.calibrated = true;
-            self.poll_ms = (self.detect_avg_us / 1000 * 5).max(50).min(500);
-            eprintln!("[CAL] calibrate poll={}ms detect_avg={}us samples={}",
-                self.poll_ms, self.detect_avg_us, self.detect_samples);
+        if self.detect_samples == 10 {
+            eprintln!("[CAL] detect avg={}us samples={}", self.detect_avg_us, self.detect_samples);
         }
     }
 
     fn record_jitter(&mut self, drop: u64) {
         if drop > self.max_jitter_drop {
+            let old = self.drop_thresh;
             self.max_jitter_drop = drop;
             self.drop_thresh = (drop as f64 * 1.5) as u64;
-            self.nz_max = self.nz_max.max(self.nz_base);
-            eprintln!("[CAL] jitter max={}ms drop_thresh={}ms", drop, self.drop_thresh);
+            eprintln!("[CAL] jitter max={}ms drop={}ms→{}ms (×1.5)", drop, old, self.drop_thresh);
         }
     }
 
@@ -142,16 +141,20 @@ impl Cal {
         let now = std::time::Instant::now();
         let since = self.last_stop_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(999.0);
         if since < 30.0 {
-            self.cycle_speed = (self.cycle_speed + since as u64 / 2).min(timeout as u64 / 2);
-            self.nz_curr = (self.nz_curr + 2).min(self.nz_max.max(timeout.min(14)));
-            self.nz_cooldown_secs = (self.nz_cooldown_secs + self.cycle_speed / 2).min(30);
-            eprintln!("[CAL] cycle speed={}s nz={} cooldown={}s", self.cycle_speed, self.nz_curr, self.nz_cooldown_secs);
+            self.cycle_speed = (self.cycle_speed * self.cycles + since as u64) / (self.cycles + 1);
+            self.cycles += 1;
+            let new_nz = (self.nz_curr + timeout).min(timeout * 2);
+            if new_nz != self.nz_curr {
+                eprintln!("[CAL] cycle#{} gap={}s speed_avg={}s nz={}→{} (jump by timeout={})",
+                    self.cycles, since as u64, self.cycle_speed, self.nz_curr, new_nz, timeout);
+                self.nz_curr = new_nz;
+            }
         } else {
-            if self.nz_curr > self.nz_base { eprintln!("[CAL] calm period {}s — reset nz={} cooldown={}",
-                since as u64, self.nz_base, 10); }
+            if self.cycles > 0 {
+                eprintln!("[CAL] calm gap={}s after {} cycles — nz={}→{}", since as u64, self.cycles, self.nz_curr, self.nz_base);
+            }
             self.nz_curr = self.nz_base;
-            self.nz_cooldown_secs = 10;
-            self.cycle_speed = 0;
+            self.cycles = 0; self.cycle_speed = 0;
         }
         self.last_stop_at = Some(now);
     }
@@ -252,9 +255,12 @@ fn idle_monitor_loop(app: AppHandle) {
         } else { ai = 0; }
 
         let tus = _ts.elapsed().as_micros() as u64;
+        cal.record_tick(tus);
         let poll_us = cal.poll_ms * 1000;
         if tus > poll_us * 150 / 100 {
-            eprintln!("[TIMING] tick {}ms poll={}ms overhead={}ms", tus / 1000, cal.poll_ms, tus.saturating_sub(poll_us) / 1000);
+            eprintln!("[TIMING] tick {}ms poll={}ms overhead={}ms p={} nz={} dt={} cyc={}",
+                tus / 1000, cal.poll_ms, tus.saturating_sub(poll_us) / 1000,
+                cal.poll_ms, cal.nz_curr, cal.drop_thresh, cal.cycles);
         }
     }
 
