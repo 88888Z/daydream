@@ -84,134 +84,151 @@ fn manual_stop(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct Cal {
+    // calibrated
+    poll_ms: u64,
+    drop_thresh: u64,
+    // adaptive nz
+    nz_base: u64,
+    nz_curr: u64,
+    nz_max: u64,
+    nz_cooldown_secs: u64,
+    // measured
+    max_jitter_drop: u64,
+    detect_avg_us: u64,
+    detect_samples: u64,
+    last_stop_at: Option<std::time::Instant>,
+    cycle_speed: u64,
+    // state
+    calibrated: bool,
+}
+
+impl Cal {
+    fn new() -> Self {
+        Self {
+            poll_ms: 200,
+            drop_thresh: 2000,
+            nz_base: 4, nz_curr: 4, nz_max: 4, nz_cooldown_secs: 10,
+            max_jitter_drop: 0,
+            detect_avg_us: 0, detect_samples: 0,
+            last_stop_at: None, cycle_speed: 0,
+            calibrated: false,
+        }
+    }
+
+    fn record_detect(&mut self, us: u64) {
+        if self.detect_samples == 0 { self.detect_avg_us = us; }
+        else { self.detect_avg_us = (self.detect_avg_us * self.detect_samples + us) / (self.detect_samples + 1); }
+        self.detect_samples += 1;
+        if !self.calibrated && self.detect_samples >= 10 {
+            self.calibrated = true;
+            self.poll_ms = (self.detect_avg_us / 1000 * 5).max(50).min(500);
+            eprintln!("[CAL] calibrate poll={}ms detect_avg={}us samples={}",
+                self.poll_ms, self.detect_avg_us, self.detect_samples);
+        }
+    }
+
+    fn record_jitter(&mut self, drop: u64) {
+        if drop > self.max_jitter_drop {
+            self.max_jitter_drop = drop;
+            self.drop_thresh = (drop as f64 * 1.5) as u64;
+            self.nz_max = self.nz_max.max(self.nz_base);
+            eprintln!("[CAL] jitter max={}ms drop_thresh={}ms", drop, self.drop_thresh);
+        }
+    }
+
+    fn record_stop(&mut self, timeout: u64) {
+        let now = std::time::Instant::now();
+        let since = self.last_stop_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(999.0);
+        if since < 30.0 {
+            self.cycle_speed = (self.cycle_speed + since as u64 / 2).min(timeout as u64 / 2);
+            self.nz_curr = (self.nz_curr + 2).min(self.nz_max.max(timeout.min(14)));
+            self.nz_cooldown_secs = (self.nz_cooldown_secs + self.cycle_speed / 2).min(30);
+            eprintln!("[CAL] cycle speed={}s nz={} cooldown={}s", self.cycle_speed, self.nz_curr, self.nz_cooldown_secs);
+        } else {
+            if self.nz_curr > self.nz_base { eprintln!("[CAL] calm period {}s — reset nz={} cooldown={}",
+                since as u64, self.nz_base, 10); }
+            self.nz_curr = self.nz_base;
+            self.nz_cooldown_secs = 10;
+            self.cycle_speed = 0;
+        }
+        self.last_stop_at = Some(now);
+    }
+}
+
 fn idle_monitor_loop(app: AppHandle) {
-    let mut previous_idle: Option<u64> = None;
-    let mut consec_idle_for_autoplay: u64 = 0;
-    let mut near_zero_count: u64 = 0;
-    let mut steady_seen: bool = false;
-    let mut nz_threshold: u64 = 4;
-    let mut last_stop: Option<std::time::Instant> = None;
-    let mut after_climb: bool = false;
-    let mut consec_detected: u64 = 0;
-    // Ring buffer of last 10 idle_ms values for jitter diagnosis
+    let mut prev: Option<u64> = None;
+    let mut ai: u64 = 0; // consec_idle_for_autoplay
+    let mut nz: u64 = 0; // near_zero_count
+    let mut steady: bool = false;
+    let mut ac: bool = false; // after_climb
+    let mut cd: u64 = 0; // consec_detected
+    let mut cal = Cal::new();
     let mut hist: [u64; 10] = [0; 10];
-    let mut hist_pos: usize = 0;
+    let mut hp: usize = 0;
 
     while IDLE_MONITOR_ACTIVE.load(Ordering::SeqCst) {
-        let _tick_start = std::time::Instant::now();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ts = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(cal.poll_ms));
 
         let state = app.state::<ConfigState>();
         let config = state.config.lock().unwrap();
         let timeout = config.global.idle_timeout_seconds;
         let enabled = config.global.idle_enabled;
-        let should_autoplay = config.global.autoplay_on_idle;
+        let autoplay = config.global.autoplay_on_idle;
         let videos = config.videos.clone();
-        let global_params = config.global.default_params.clone();
-        let last_played_from_config = config.global.last_played_entry;
-        let is_playing = IS_PLAYING.load(Ordering::SeqCst);
+        let gp = config.global.default_params.clone();
+        let lpc = config.global.last_played_entry;
+        let playing = IS_PLAYING.load(Ordering::SeqCst);
         drop(config);
+        cal.nz_max = cal.nz_max.max(timeout.min(14));
 
         if !enabled || videos.is_empty() {
-            previous_idle = None;
-            consec_idle_for_autoplay = 0;
-            near_zero_count = 0;
-            steady_seen = false;
-            after_climb = false;
-            hist_pos = 0; consec_detected = 0;
+            prev = None; ai = 0; nz = 0; steady = false; ac = false; hp = 0; cd = 0;
             continue;
         }
 
+        let t0 = std::time::Instant::now();
         let idle_ms = match idle::IdleDetector::idle_ms() {
-            Ok(ms) => ms,
-            Err(e) => {
-                eprintln!("[idle] detect error: {e} — resetting");
-                previous_idle = None;
-                consec_idle_for_autoplay = 0;
-                near_zero_count = 0;
-                steady_seen = false;
-                after_climb = false;
-                hist_pos = 0; consec_detected = 0;
-                continue;
-            }
+            Ok(ms) => { cal.record_detect(t0.elapsed().as_micros() as u64); ms },
+            Err(e) => { eprintln!("[idle] detect error {e}"); prev = None; ai = 0; nz = 0; steady = false; ac = false; hp = 0; cd = 0; continue }
         };
 
-        // Store in ring buffer
-        hist[hist_pos] = idle_ms;
-        hist_pos = (hist_pos + 1) % hist.len();
+        hist[hp] = idle_ms; hp = (hp + 1) % hist.len();
+        let s = idle_ms / 1000;
+        let p = prev;
+        let drop = p.map(|x| x.saturating_sub(idle_ms)).unwrap_or(0);
+        let det = drop > cal.drop_thresh;
+        let mpv = MPV_JUST_TRANSITIONED.swap(false, Ordering::SeqCst);
 
-        let idle_secs = idle_ms / 1000;
-        let prev = previous_idle;
-        let detected_interaction = prev
-            .map(|p| p.saturating_sub(idle_ms) > 2000)
-            .unwrap_or(false);
-        let mpv_flag = MPV_JUST_TRANSITIONED.swap(false, Ordering::SeqCst);
+        if !steady && s >= timeout { steady = true; eprintln!("[idle] steady s={} >= timeout={}", s, timeout); }
 
-        let near_zero = idle_secs < 1;
-        let timer_climbing = !detected_interaction && idle_secs >= 1;
-        let idle_high_enough = idle_secs >= timeout;
+        let rem = timeout.saturating_sub(s.min(timeout));
+        let _ = app.emit("idle-status", serde_json::json!({ "remaining": rem }));
 
-        if !steady_seen && idle_high_enough {
-            steady_seen = true;
-            eprintln!("[idle] steady idle_secs={} >= timeout={}", idle_secs, timeout);
-        }
-
-        let remaining = timeout.saturating_sub(idle_secs.min(timeout));
-        let _ = app.emit("idle-status", serde_json::json!({ "remaining": remaining }));
-
-        // PATH 0: interaction detected — dump history, then fall through to NZ counting
-        if detected_interaction && !mpv_flag && is_playing {
-            consec_detected += 1;
+        // record jitter for calibration (big drops without mpv, but not user — just observing)
+        if det && !mpv && playing {
             let h: Vec<String> = hist.iter().enumerate().map(|(i, &v)| format!("{}:{}", i, v)).collect();
-            eprintln!("[idle] DETECT hist=[{}] prev={:?} curr={} consec={}", h.join(","), prev, idle_ms, consec_detected);
-            // Fall through to NZ counting — don't stop instantly, let NZ threshold handle it
-        }
-
-        // PATH 1: mpv transition
-        if detected_interaction && mpv_flag {
-            near_zero_count = 0; after_climb = false;
-            previous_idle = Some(idle_ms);
-            consec_idle_for_autoplay = 0;
-            continue;
-        }
-
-        // PATH 2: timer climbing
-        if is_playing && timer_climbing {
-            near_zero_count = 0; after_climb = true;
-            previous_idle = Some(idle_ms);
-            consec_idle_for_autoplay = 0;
-            continue;
-        }
-
-        // PATH 3: near-zero while playing
-        if is_playing && near_zero && !mpv_flag {
-            if !steady_seen {
-                previous_idle = Some(idle_ms);
-                consec_idle_for_autoplay = 0;
-                continue;
+            cd += 1;
+            // calibrate: if drop is > our threshold and has happened before, it's jitter not user
+            if cal.detect_samples > 5 && drop > cal.max_jitter_drop {
+                cal.record_jitter(drop);
             }
-            if after_climb {
-                after_climb = false;
-                previous_idle = Some(idle_ms);
-                consec_idle_for_autoplay = 0;
-                continue;
-            }
-            near_zero_count += 1;
-            previous_idle = Some(idle_ms);
-            consec_idle_for_autoplay = 0;
-            if near_zero_count >= nz_threshold {
-                // Adaptive threshold: if stops happen rapidly, increase threshold to break the cycle
-                let since_last = last_stop.map(|t| t.elapsed().as_secs()).unwrap_or(99);
-                if since_last < 10 {
-                    nz_threshold = (nz_threshold + 2).min(14);
-                    eprintln!("[idle] NZ-STOP idle={}ms nz={}/{} fast_cycle={}s threshold→{}",
-                        idle_ms, near_zero_count, nz_threshold, since_last, nz_threshold);
-                } else {
-                    nz_threshold = 4;
-                    eprintln!("[idle] NZ-STOP idle={}ms nz={}/{}", idle_ms, near_zero_count, nz_threshold);
-                }
-                last_stop = Some(std::time::Instant::now());
-                near_zero_count = 0; after_climb = false;
+            eprintln!("[idle] DETECT#{}=drop={}ms hist=[{}] prev={:?} curr={}", cd, drop, h.join(","), p, idle_ms);
+        } else { cd = 0; }
+
+        if det && mpv { nz = 0; ac = false; prev = Some(idle_ms); ai = 0; continue; }
+        if playing && !det && s >= 1 { nz = 0; ac = true; prev = Some(idle_ms); ai = 0; continue; }
+
+        if playing && s < 1 && !mpv {
+            if !steady { prev = Some(idle_ms); ai = 0; continue; }
+            if ac { ac = false; prev = Some(idle_ms); ai = 0; continue; }
+            nz += 1; prev = Some(idle_ms); ai = 0;
+            if nz >= cal.nz_curr {
+                cal.record_stop(timeout);
+                eprintln!("[idle] NZ-STOP idle={}ms nz={}/{}", idle_ms, nz, cal.nz_curr);
+                nz = 0; ac = false;
                 IS_PLAYING.store(false, Ordering::SeqCst);
                 let _ = app.emit("playback-stopped", ());
                 stop_playback(&app);
@@ -219,44 +236,29 @@ fn idle_monitor_loop(app: AppHandle) {
             continue;
         }
 
-        // passthrough: only log climbing progression, silent otherwise
-        near_zero_count = 0;
-        previous_idle = Some(idle_ms);
+        nz = 0; prev = Some(idle_ms);
 
-        if idle_high_enough {
-            after_climb = false;
-            if consec_idle_for_autoplay == 0 && !is_playing {
-                eprintln!("[idle] climbing r={}s idle={}ms", remaining, idle_ms);
-            }
-            consec_idle_for_autoplay += 1;
-            if consec_idle_for_autoplay >= 2 && should_autoplay && !is_playing {
-                eprintln!("[idle] AUTOPLAY videos={} rotate={:?}", videos.len(), last_played_from_config);
+        if s >= timeout {
+            ac = false;
+            if ai == 0 && !playing { eprintln!("[idle] climbing r={}s idle={}ms", rem, idle_ms); }
+            ai += 1;
+            if ai >= 2 && autoplay && !playing {
+                eprintln!("[idle] AUTOPLAY videos={} rotate={:?}", videos.len(), lpc);
                 IS_PLAYING.store(true, Ordering::SeqCst);
                 let _ = app.emit("playback-started", ());
-                let app_clone = app.clone();
-                let v = videos.clone();
-                let p = global_params.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = start_playback(&app_clone, &v, &p, last_played_from_config) {
-                        eprintln!("[idle] autoplay failed: {e}");
-                    }
-                });
+                let ac2 = app.clone(); let v2 = videos.clone(); let p2 = gp.clone();
+                std::thread::spawn(move || { if let Err(e) = start_playback(&ac2, &v2, &p2, lpc) { eprintln!("[idle] autoplay {e}"); } });
             }
-        } else {
-            consec_idle_for_autoplay = 0;
-        }
+        } else { ai = 0; }
 
-        // slow tick monitor
-        let tick_us = _tick_start.elapsed().as_micros();
-        if tick_us > 300_000 {
-            eprintln!("[TIMING] tick {}ms overhead {}ms", tick_us / 1000, tick_us.saturating_sub(200_000) / 1000);
+        let tus = _ts.elapsed().as_micros() as u64;
+        let poll_us = cal.poll_ms * 1000;
+        if tus > poll_us * 150 / 100 {
+            eprintln!("[TIMING] tick {}ms poll={}ms overhead={}ms", tus / 1000, cal.poll_ms, tus.saturating_sub(poll_us) / 1000);
         }
     }
 
-    if IS_PLAYING.load(Ordering::SeqCst) {
-        IS_PLAYING.store(false, Ordering::SeqCst);
-        stop_playback(&app);
-    }
+    if IS_PLAYING.load(Ordering::SeqCst) { IS_PLAYING.store(false, Ordering::SeqCst); stop_playback(&app); }
 }
 
 fn start_playback(app: &AppHandle, videos: &[config::VideoItem], global: &config::VideoParams,
