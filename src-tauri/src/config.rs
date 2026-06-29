@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Emitter, State};
@@ -45,6 +46,13 @@ pub struct VideoItem {
     pub path: String,
     pub filename: String,
     pub local: Option<VideoParams>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddVideosResult {
+    pub items: Vec<VideoItem>,
+    pub added: usize,
+    pub duplicates: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,11 +148,21 @@ pub fn update_global_settings(
 }
 
 #[tauri::command]
-pub fn add_videos(app: tauri::AppHandle, state: State<ConfigState>, paths: Vec<String>) -> Result<Vec<VideoItem>, String> {
+pub fn add_videos(app: tauri::AppHandle, state: State<ConfigState>, paths: Vec<String>) -> Result<AddVideosResult, String> {
     let total = paths.len();
-    let mut items = Vec::with_capacity(total);
+    let config = state.config.lock().unwrap();
+    let existing_paths: HashSet<&String> = config.videos.iter().map(|v| &v.path).collect();
+    let new_paths: Vec<String> = paths.into_iter().filter(|p| !existing_paths.contains(p)).collect();
+    let duplicates = total - new_paths.len();
+    let added = new_paths.len();
+    drop(config);
 
-    for (i, path) in paths.into_iter().enumerate() {
+    if new_paths.is_empty() {
+        return Ok(AddVideosResult { items: vec![], added: 0, duplicates });
+    }
+
+    let mut items = Vec::with_capacity(added);
+    for (i, path) in new_paths.into_iter().enumerate() {
         let filename = std::path::Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -170,7 +188,8 @@ pub fn add_videos(app: tauri::AppHandle, state: State<ConfigState>, paths: Vec<S
         "current": total,
         "total": total,
     }));
-    Ok(cloned)
+    eprintln!("[daydream-config] add_videos: added={} duplicates={} total={}", added, duplicates, total);
+    Ok(AddVideosResult { items: cloned, added, duplicates })
 }
 
 #[tauri::command]

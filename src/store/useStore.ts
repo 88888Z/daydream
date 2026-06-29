@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AppConfig, GlobalSettings, VideoItem, VideoParams } from "../types";
+import type { AppConfig, AddVideosResult, GlobalSettings, VideoItem, VideoParams } from "../types";
 
 interface NowPlaying {
   itemIndex: number;
@@ -18,6 +18,9 @@ interface AppState {
   thumbnailCache: Record<string, string>;
   selectedIds: string[];
   addProgress: { current: number; total: number } | null;
+  toast: { message: string; variant: "success" | "error" | "info" } | null;
+  showToast: (message: string, variant: "success" | "error" | "info") => void;
+  clearToast: () => void;
   loadConfig: () => Promise<void>;
   setEditingItem: (item: VideoItem | null) => void;
   setShowGlobalSettings: (show: boolean) => void;
@@ -62,6 +65,11 @@ export const useStore = create<AppState>((set, get) => ({
   thumbnailCache: {},
   selectedIds: [],
   addProgress: null,
+  toast: null,
+  showToast: (message, variant) => {
+    set({ toast: { message, variant } });
+  },
+  clearToast: () => set({ toast: null }),
 
   loadConfig: async () => {
     try {
@@ -96,10 +104,19 @@ export const useStore = create<AppState>((set, get) => ({
 
   addVideos: async (paths) => {
     try {
-      const items = await invoke<VideoItem[]>("add_videos", { paths });
-      set((s) => ({ config: { ...s.config, videos: [...s.config.videos, ...items] } }));
+      const result = await invoke<AddVideosResult>("add_videos", { paths });
+      set((s) => ({ config: { ...s.config, videos: [...s.config.videos, ...result.items] } }));
+      const showToast = useStore.getState().showToast;
+      if (result.duplicates > 0 && result.added > 0) {
+        showToast(`Added ${result.added} video${result.added !== 1 ? "s" : ""} (${result.duplicates} duplicate${result.duplicates !== 1 ? "s" : ""} skipped)`, "success");
+      } else if (result.added > 0) {
+        showToast(`Added ${result.added} video${result.added !== 1 ? "s" : ""}`, "success");
+      } else if (result.duplicates > 0) {
+        showToast(`${result.duplicates} duplicate${result.duplicates !== 1 ? "s" : ""} skipped — no new videos added`, "info");
+      }
     } catch (e) {
       console.error("Failed to add videos", e);
+      useStore.getState().showToast("Failed to add videos", "error");
     }
   },
 

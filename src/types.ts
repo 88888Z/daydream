@@ -24,3 +24,9 @@ export interface AppConfig {
   global: GlobalSettings;
   videos: VideoItem[];
 }
+
+export interface AddVideosResult {
+  items: VideoItem[];
+  added: number;
+  duplicates: number;
+}
