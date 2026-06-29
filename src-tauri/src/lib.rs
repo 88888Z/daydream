@@ -45,13 +45,11 @@ fn is_playing() -> bool {
 #[tauri::command]
 fn manual_play(app: AppHandle, state: tauri::State<ConfigState>,
     selected_ids: Vec<String>) -> Result<(), String> {
+    let _t = std::time::Instant::now();
     let config = state.config.lock().unwrap();
     let videos = config.videos.clone();
     let global = config.global.default_params.clone();
     let last_played = config.global.last_played_entry;
-    eprintln!("[daydream] manual_play: videos in order ({}) {:?}",
-        videos.len(),
-        videos.iter().enumerate().map(|(i, v)| format!("{}:{}", i, v.filename)).collect::<Vec<_>>());
     drop(config);
 
     if videos.is_empty() {
@@ -59,7 +57,6 @@ fn manual_play(app: AppHandle, state: tauri::State<ConfigState>,
     }
 
     let rotate_to = if selected_ids.is_empty() {
-        eprintln!("[daydream] play: no selection, resume from last_played={:?}", last_played);
         last_played
     } else {
         let found: Vec<usize> = videos.iter()
@@ -67,21 +64,23 @@ fn manual_play(app: AppHandle, state: tauri::State<ConfigState>,
             .filter(|(_, v)| selected_ids.contains(&v.id))
             .map(|(i, _)| i)
             .collect();
-        eprintln!("[daydream] play: selected_ids={:?} found item_indices={:?}", selected_ids, found);
         found.into_iter().min()
     };
 
     IS_PLAYING.store(true, Ordering::SeqCst);
     start_playback(&app, &videos, &global, rotate_to).map_err(|e| e.to_string())?;
     let _ = app.emit("playback-started", ());
+    eprintln!("[TIMING] manual_play {}us", _t.elapsed().as_micros());
     Ok(())
 }
 
 #[tauri::command]
 fn manual_stop(app: AppHandle) -> Result<(), String> {
+    let _t = std::time::Instant::now();
     IS_PLAYING.store(false, Ordering::SeqCst);
     stop_playback(&app);
     let _ = app.emit("playback-stopped", ());
+    eprintln!("[TIMING] manual_stop {}us", _t.elapsed().as_micros());
     Ok(())
 }
 
@@ -95,29 +94,32 @@ fn idle_monitor_loop(app: AppHandle) {
 
     while IDLE_MONITOR_ACTIVE.load(Ordering::SeqCst) {
         let tick_start = std::time::Instant::now();
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let sleep_done = std::time::Instant::now();
+        let sleep_overhead = sleep_done.duration_since(tick_start).as_micros().saturating_sub(1_000_000);
 
-        let t0 = std::time::Instant::now();
+        let t_lock = std::time::Instant::now();
         let state = app.state::<ConfigState>();
         let config = state.config.lock().unwrap();
         let timeout = config.global.idle_timeout_seconds;
         let enabled = config.global.idle_enabled;
         let should_autoplay = config.global.autoplay_on_idle;
-        let t1 = std::time::Instant::now();
+        let t_clone_start = std::time::Instant::now();
         let videos = config.videos.clone();
         let global_params = config.global.default_params.clone();
         let last_played_from_config = config.global.last_played_entry;
         let is_playing = IS_PLAYING.load(Ordering::SeqCst);
-        let t2 = std::time::Instant::now();
+        let t_log_start = std::time::Instant::now();
         eprintln!("[daydream-idle] config loaded: last_played_from_config={:?} timeout={} enabled={} autoplay={} videos={}",
             last_played_from_config, timeout, enabled, should_autoplay, videos.len());
-        let t3 = std::time::Instant::now();
         drop(config);
-        let t4 = std::time::Instant::now();
-        eprintln!("[daydream-idle] TIMING lock={}us clone={}us log_and_drop={}us",
-            t1.duration_since(t0).as_micros(),
-            t2.duration_since(t1).as_micros(),
-            t4.duration_since(t2).as_micros());
+        let t_timing_log = std::time::Instant::now();
+        let lock_us = t_clone_start.duration_since(t_lock).as_micros();
+        let clone_us = t_log_start.duration_since(t_clone_start).as_micros();
+        let log_drop_us = t_timing_log.duration_since(t_log_start).as_micros();
+        eprintln!("[daydream-idle] TIMING sleep_overhead={}us lock={}us clone={}us log_drop={}us total_pre_idle={}us",
+            sleep_overhead, lock_us, clone_us, log_drop_us,
+            t_timing_log.duration_since(t_lock).as_micros());
 
         if !enabled || videos.is_empty() {
             eprintln!("[daydream-idle] idle disabled or no videos — resetting state");
@@ -133,7 +135,8 @@ fn idle_monitor_loop(app: AppHandle) {
         let idle_detect_start = std::time::Instant::now();
         let idle_ms = match idle::IdleDetector::idle_ms() {
             Ok(ms) => {
-                eprintln!("[daydream-idle] TIMING idle_ms()={}us result={}ms", idle_detect_start.elapsed().as_micros(), ms);
+                let idle_us = idle_detect_start.elapsed().as_micros();
+                eprintln!("[daydream-idle] TIMING idle_ms={}us result={}ms", idle_us, ms);
                 ms
             },
             Err(e) => {
@@ -147,6 +150,7 @@ fn idle_monitor_loop(app: AppHandle) {
                 continue;
             }
         };
+        let post_idle = std::time::Instant::now();
 
         let idle_secs = idle_ms / 1000;
 
@@ -166,9 +170,17 @@ fn idle_monitor_loop(app: AppHandle) {
         }
 
         let remaining = timeout.saturating_sub(idle_secs.min(timeout));
+        let t_tick_log = std::time::Instant::now();
         eprintln!("[daydream-idle] tick idle_ms={} idle_secs={} prev={:?} remaining={} timeout={} is_playing={} detected={} mpv_flag={} near_zero={} climbing={} steady={} nz_count={} after_climb={} consec_idle={} suppressed={}",
             idle_ms, idle_secs, prev, remaining, timeout, is_playing, detected_interaction, mpv_flag, near_zero, timer_climbing, steady_seen, near_zero_count, after_climb, consec_idle_for_autoplay, suppressed_count);
+        let t_emit = std::time::Instant::now();
         let _ = app.emit("idle-status", serde_json::json!({ "remaining": remaining }));
+        let t_post_emit = std::time::Instant::now();
+        let logic_start = std::time::Instant::now();
+        eprintln!("[daydream-idle] TIMING idle_logic={}us tick_log={}us emit={}us",
+            post_idle.duration_since(idle_detect_start).as_micros(),
+            t_emit.duration_since(t_tick_log).as_micros(),
+            t_post_emit.duration_since(t_emit).as_micros());
 
         // === PATH 0: strong signal — genuine user interaction (no mpv involved) ===
         if detected_interaction && !mpv_flag && is_playing {
@@ -279,9 +291,14 @@ fn idle_monitor_loop(app: AppHandle) {
         }
 
         let tick_total = tick_start.elapsed();
-        if tick_total > std::time::Duration::from_millis(1100) {
-            eprintln!("[daydream-idle] TIMING tick SLOW total={}ms (sleep=1000ms, overhead={}ms)", tick_total.as_millis(), tick_total.as_millis().saturating_sub(1000));
-        }
+        let path_end = std::time::Instant::now();
+        eprintln!("[daydream-idle] TIMING tick_total={}us sleep_over={}us pre_idle={}us idle={}us logic={}us path={}us",
+            tick_total.as_micros(),
+            sleep_overhead,
+            t_timing_log.duration_since(t_lock).as_micros(),
+            idle_detect_start.elapsed().as_micros(),
+            post_idle.duration_since(idle_detect_start).as_micros(),
+            path_end.duration_since(logic_start).as_micros());
     }
 
     eprintln!("[daydream-idle] monitor loop exiting");
@@ -294,14 +311,17 @@ fn idle_monitor_loop(app: AppHandle) {
 
 fn start_playback(app: &AppHandle, videos: &[config::VideoItem], global: &config::VideoParams,
     rotate_to: Option<usize>) -> Result<(), player::PlayerError> {
+    let _t = std::time::Instant::now();
     let player = app.state::<MpvPlayer>();
-    player.start_with_monitor(videos, global, rotate_to, app.clone())
+    let r = player.start_with_monitor(videos, global, rotate_to, app.clone());
+    eprintln!("[TIMING] start_playback {}us", _t.elapsed().as_micros());
+    r
 }
 
 fn stop_playback(app: &AppHandle) {
+    let _t = std::time::Instant::now();
     LAST_MPV_TRANSITION_MS.store(0, Ordering::SeqCst);
     let entry = LAST_PLAYED_ENTRY_MS.load(Ordering::SeqCst);
-    eprintln!("[daydream] stop_playback: LAST_PLAYED_ENTRY_MS={} will be saved to config", entry);
     if entry >= 0 {
         let state = app.state::<ConfigState>();
         let mut config = state.config.lock().unwrap();
@@ -311,6 +331,7 @@ fn stop_playback(app: &AppHandle) {
     }
     let player = app.state::<MpvPlayer>();
     player.stop();
+    eprintln!("[TIMING] stop_playback {}us", _t.elapsed().as_micros());
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

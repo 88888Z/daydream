@@ -45,21 +45,18 @@ impl MpvPlayer {
         items: &[config::VideoItem],
         global: &config::VideoParams,
     ) -> (Vec<String>, Vec<usize>) {
-        eprintln!("[daydream-player] build_expanded_paths: {} items in order: {:?}",
-            items.len(),
-            items.iter().enumerate().map(|(i, v)| format!("{}:{}", i, v.filename)).collect::<Vec<_>>());
+        let _t = std::time::Instant::now();
         let mut paths: Vec<String> = Vec::new();
         let mut map: Vec<usize> = Vec::new();
         for (idx, item) in items.iter().enumerate() {
             let params = item.local.as_ref().unwrap_or(global);
-            for r in 0..params.repeats.max(1) {
+            for _ in 0..params.repeats.max(1) {
                 paths.push(item.path.clone());
                 map.push(idx);
-                eprintln!("[daydream-player] build  item_idx={} repeat={}/{} filename={} path={}",
-                    idx, r + 1, params.repeats.max(1), item.filename, item.path);
             }
         }
-        eprintln!("[daydream-player] build_expanded_paths: total expanded entries={}", paths.len());
+        eprintln!("[TIMING] build_expanded_paths {}us items={} expanded={}",
+            _t.elapsed().as_micros(), items.len(), paths.len());
         (paths, map)
     }
 
@@ -68,6 +65,7 @@ impl MpvPlayer {
         expanded_paths: &[String],
         rotate_to_entry: Option<usize>,
     ) -> Result<(Child, PathBuf), PlayerError> {
+        let _t = std::time::Instant::now();
         let socket_path = PathBuf::from(MPV_SOCKET);
         let _ = std::fs::remove_file(&socket_path);
 
@@ -91,14 +89,9 @@ impl MpvPlayer {
             "--loop-playlist=inf".into(),
         ];
         if let Some(entry) = rotate_to_entry {
-            eprintln!("[daydream] --playlist-start={} (expanded_paths_count={})", entry, expanded_paths.len());
             args.push(format!("--playlist-start={entry}"));
-        } else {
-            eprintln!("[daydream] no --playlist-start (rotate_to_entry=None, expanded_paths_count={})", expanded_paths.len());
         }
-        for (i, p) in expanded_paths.iter().enumerate() {
-            let fname = std::path::Path::new(p).file_name().map(|n| n.to_string_lossy()).unwrap_or(std::borrow::Cow::Borrowed("?"));
-            eprintln!("[daydream-player] mpv arg path={} filename={}", i, fname);
+        for p in expanded_paths.iter() {
             args.push(p.clone());
         }
 
@@ -113,6 +106,8 @@ impl MpvPlayer {
             .spawn()
             .map_err(|e| PlayerError::Spawn { source: e })?;
 
+        eprintln!("[TIMING] spawn_mpv {}us paths={} rotate={:?}",
+            _t.elapsed().as_micros(), expanded_paths.len(), rotate_to_entry);
         Ok((child, socket_path))
     }
 
@@ -152,8 +147,12 @@ impl MpvPlayer {
                         Ok(json) => {
                             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&json) {
                                 let event_name = obj.get("event").and_then(|e| e.as_str()).unwrap_or("");
-                                if event_name == "playback-restart" || event_name == "start-file" {
-                                    eprintln!("[daydream-player] RAW EVENT {}: {}", event_name, json);
+                                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+
+                                // Log all key events with timestamps for transition latency tracking
+                                if event_name == "end-file" || event_name == "start-file" || event_name == "playback-restart" {
+                                    let eid = obj.get("playlist_entry_id").and_then(|e| e.as_u64()).unwrap_or(0);
+                                    eprintln!("[TIMING] mpv_event={} t={}ms entry_id={}", event_name, now_ms, eid);
                                 }
 
                                 // === start-file: carries playlist_entry_id, store immediately ===
@@ -161,8 +160,6 @@ impl MpvPlayer {
                                     last_entry_id = obj.get("playlist_entry_id").and_then(|e| e.as_u64());
                                     if let Some(eid) = last_entry_id {
                                         let idx = (eid as usize).saturating_sub(1);
-                                        eprintln!("[daydream-player] start-file entry_id={} idx={} entry_to_item={:?}",
-                                            eid, idx, entry_to_item);
                                         crate::LAST_PLAYED_ENTRY_MS.store(idx as i64, std::sync::atomic::Ordering::SeqCst);
                                         if let Some(&item_idx) = entry_to_item.get(idx) {
                                             let _ = app.emit("now-playing", serde_json::json!({
@@ -170,8 +167,6 @@ impl MpvPlayer {
                                                 "entryIndex": idx,
                                                 "totalEntries": total_items,
                                             }));
-                                        } else {
-                                            eprintln!("[daydream-player] start-file WARNING entry_to_item.get({}) None", idx);
                                         }
                                     }
                                 }
@@ -179,20 +174,16 @@ impl MpvPlayer {
                                 // === playback-restart: set transition flag, apply speed/volume, emit now-playing ===
                                 if event_name == "playback-restart" {
                                     crate::MPV_JUST_TRANSITIONED.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-                                    crate::LAST_MPV_TRANSITION_MS.store(now_ms, std::sync::atomic::Ordering::SeqCst);
-                                    eprintln!("[daydream-player] playback-restart — set MPV_ flags transition_ms={}", now_ms);
+                                    crate::LAST_MPV_TRANSITION_MS.store(now_ms as i64, std::sync::atomic::Ordering::SeqCst);
 
                                     let eid = last_entry_id.unwrap_or(1);
                                     let idx = (eid as usize).saturating_sub(1);
-                                    eprintln!("[daydream-player] playback-restart using entry_id={:?} idx={}", last_entry_id, idx);
                                     crate::LAST_PLAYED_ENTRY_MS.store(idx as i64, std::sync::atomic::Ordering::SeqCst);
 
                                     // Apply speed/volume for the current video
                                     if let Some(&item_idx) = entry_to_item.get(idx) {
                                         if let Some(video) = items.get(item_idx) {
                                             let params = video.local.as_ref().unwrap_or(&global);
-                                            eprintln!("[daydream-player] transition speed={} volume={} for {}", params.speed, params.volume, video.filename);
                                             let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "speed", params.speed]}));
                                             let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "volume", params.volume]}));
                                         }
@@ -201,8 +192,6 @@ impl MpvPlayer {
                                             "entryIndex": idx,
                                             "totalEntries": total_items,
                                         }));
-                                    } else {
-                                        eprintln!("[daydream-player] playback-restart WARNING entry_to_item.get({}) None", idx);
                                     }
                                 }
                             }
@@ -221,12 +210,17 @@ impl MpvPlayer {
         rotate_to: Option<usize>,
         app: tauri::AppHandle,
     ) -> Result<(), PlayerError> {
+        let _t = std::time::Instant::now();
         if items.is_empty() {
+            eprintln!("[TIMING] start_with_monitor {}us items=0 EMPTY", _t.elapsed().as_micros());
             return Ok(());
         }
+        let mut stop_time: u64 = 0;
 
         if self.is_running() {
+            let _stop_t = std::time::Instant::now();
             self.stop();
+            stop_time = _stop_t.elapsed().as_micros() as u64;
         }
 
         let (expanded_paths, entry_to_item) = Self::build_expanded_paths(items, global);
@@ -234,23 +228,22 @@ impl MpvPlayer {
 
         let rotate_to_entry = rotate_to
             .and_then(|item_idx| {
+                let _r_t = std::time::Instant::now();
                 let pos = entry_to_item.iter().position(|&i| i == item_idx);
-                eprintln!("[daydream] RESOLVE rotate_to item_idx={} entry_to_item={:?} total_items={} -> entry_idx={:?}",
-                    item_idx, entry_to_item, total_items, pos);
-                if pos.is_none() {
-                    eprintln!("[daydream] RESOLVE FAILURE item_idx={} NOT FOUND in entry_to_item (len={}) — will restart from beginning",
-                        item_idx, entry_to_item.len());
-                }
+                eprintln!("[TIMING] resolve_rotate {}us item_idx={} pos={:?}", _r_t.elapsed().as_micros(), item_idx, pos);
                 pos
             });
 
+        let _spawn_t = std::time::Instant::now();
         let (child, socket_path) = self.spawn_mpv(&expanded_paths, rotate_to_entry)?;
+        let spawn_us = _spawn_t.elapsed().as_micros();
 
         let stop_signal = Arc::new(AtomicBool::new(false));
         *self.stop_signal.lock().unwrap() = Some(stop_signal.clone());
         *self.child.lock().unwrap() = Some(child);
 
         // Connect event reader as soon as socket appears (before IPC commands)
+        let _reader_t = std::time::Instant::now();
         let mut reader_spawned = false;
         for _ in 0..30 {
             if socket_path.exists() {
@@ -270,6 +263,7 @@ impl MpvPlayer {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        let reader_us = _reader_t.elapsed().as_micros();
         if !reader_spawned {
             self.stop();
             return Err(PlayerError::SocketTimeout);
@@ -290,7 +284,6 @@ impl MpvPlayer {
         // Set speed/volume for first item
         if let Some(first) = items.first() {
             let params = first.local.as_ref().unwrap_or(global);
-            eprintln!("[daydream-player] set speed={} volume={} for first item {}", params.speed, params.volume, first.filename);
             let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "speed", params.speed]}));
             let _ = Self::send_cmd(&serde_json::json!({"command": ["set_property", "volume", params.volume]}));
         }
@@ -332,33 +325,30 @@ impl MpvPlayer {
             }
         });
 
+        eprintln!("[TIMING] start_with_monitor {}us spawn={}us reader={}us stop={}us items={} expanded={}",
+            _t.elapsed().as_micros(), spawn_us, reader_us, stop_time, items.len(), expanded_paths.len());
         Ok(())
     }
 
     fn send_cmd(cmd: &serde_json::Value) -> Result<(), PlayerError> {
-        let start = std::time::Instant::now();
+        let _t = std::time::Instant::now();
         let socket_path = PathBuf::from(MPV_SOCKET);
         if !socket_path.exists() {
-            eprintln!("[daydream-player] send_cmd TIMING socket_check={}us", start.elapsed().as_micros());
             return Err(PlayerError::NotRunning);
         }
         let mut stream =
             UnixStream::connect(&socket_path).map_err(|_| PlayerError::NotRunning)?;
-        let after_connect = std::time::Instant::now();
         let data = serde_json::to_vec(cmd).map_err(|e| PlayerError::Command {
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         })?;
         stream.write_all(&data).map_err(|e| PlayerError::Command { source: e })?;
         stream.write_all(b"\n").map_err(|e| PlayerError::Command { source: e })?;
-        let done = std::time::Instant::now();
-        eprintln!("[daydream-player] send_cmd TIMING total={}us connect={}us write={}us",
-            done.duration_since(start).as_micros(),
-            after_connect.duration_since(start).as_micros(),
-            done.duration_since(after_connect).as_micros());
+        eprintln!("[TIMING] send_cmd {}us", _t.elapsed().as_micros());
         Ok(())
     }
 
     pub fn stop(&self) {
+        let _t = std::time::Instant::now();
         if let Some(signal) = self.stop_signal.lock().unwrap().take() {
             signal.store(true, Ordering::SeqCst);
         }
@@ -368,5 +358,6 @@ impl MpvPlayer {
         }
         std::thread::sleep(Duration::from_millis(100));
         let _ = std::fs::remove_file(PathBuf::from(MPV_SOCKET));
+        eprintln!("[TIMING] mpv_stop {}us", _t.elapsed().as_micros());
     }
 }

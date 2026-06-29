@@ -130,9 +130,15 @@ impl ConfigState {
     }
 }
 
+macro_rules! timing { ($name:expr, $start:expr) => {
+    eprintln!("[TIMING] {} {}us", $name, $start.elapsed().as_micros());
+}; }
+
 #[tauri::command]
 pub fn get_config(state: State<ConfigState>) -> Result<AppConfig, String> {
+    let _t = std::time::Instant::now();
     let config = state.config.lock().unwrap().clone();
+    timing!("get_config", _t);
     Ok(config)
 }
 
@@ -141,14 +147,17 @@ pub fn update_global_settings(
     state: State<ConfigState>,
     settings: GlobalSettings,
 ) -> Result<(), String> {
+    let _t = std::time::Instant::now();
     let mut config = state.config.lock().unwrap();
     config.global = settings;
     state.save(&config).map_err(|e| e.to_string())?;
+    timing!("update_global_settings", _t);
     Ok(())
 }
 
 #[tauri::command]
 pub fn add_videos(app: tauri::AppHandle, state: State<ConfigState>, paths: Vec<String>) -> Result<AddVideosResult, String> {
+    let _t = std::time::Instant::now();
     let total = paths.len();
     let config = state.config.lock().unwrap();
     let existing_paths: HashSet<&String> = config.videos.iter().map(|v| &v.path).collect();
@@ -158,6 +167,7 @@ pub fn add_videos(app: tauri::AppHandle, state: State<ConfigState>, paths: Vec<S
     drop(config);
 
     if new_paths.is_empty() {
+        timing!("add_videos", _t);
         return Ok(AddVideosResult { items: vec![], added: 0, duplicates });
     }
 
@@ -188,36 +198,33 @@ pub fn add_videos(app: tauri::AppHandle, state: State<ConfigState>, paths: Vec<S
         "current": total,
         "total": total,
     }));
-    eprintln!("[daydream-config] add_videos: added={} duplicates={} total={}", added, duplicates, total);
+    timing!("add_videos", _t);
     Ok(AddVideosResult { items: cloned, added, duplicates })
 }
 
 #[tauri::command]
 pub fn remove_video(state: State<ConfigState>, id: String) -> Result<(), String> {
+    let _t = std::time::Instant::now();
     let mut config = state.config.lock().unwrap();
     config.videos.retain(|v| v.id != id);
     state.save(&config).map_err(|e| e.to_string())?;
+    timing!("remove_video", _t);
     Ok(())
 }
 
 #[tauri::command]
 pub fn reorder_videos(state: State<ConfigState>, ids: Vec<String>) -> Result<(), String> {
+    let _t = std::time::Instant::now();
     let mut config = state.config.lock().unwrap();
     let mut ordered = Vec::with_capacity(ids.len());
-    eprintln!("[daydream-config] reorder_videos: received {} ids", ids.len());
     for (pos, id) in ids.iter().enumerate() {
         if let Some(item) = config.videos.iter().find(|v| &v.id == id) {
-            eprintln!("[daydream-config] reorder  pos={} filename={} id={}", pos, item.filename, id);
             ordered.push(item.clone());
-        } else {
-            eprintln!("[daydream-config] reorder  pos={} id={} NOT FOUND in config.videos!", pos, id);
         }
     }
-    eprintln!("[daydream-config] reorder_videos: old order {:?}", config.videos.iter().map(|v| v.filename.clone()).collect::<Vec<_>>());
     config.videos = ordered;
-    let new_order: Vec<String> = config.videos.iter().map(|v| v.filename.clone()).collect();
-    eprintln!("[daydream-config] reorder_videos: new order {:?}", new_order);
     state.save(&config).map_err(|e| e.to_string())?;
+    timing!("reorder_videos", _t);
     Ok(())
 }
 
@@ -227,10 +234,12 @@ pub fn update_video_params(
     id: String,
     params: Option<VideoParams>,
 ) -> Result<(), String> {
+    let _t = std::time::Instant::now();
     let mut config = state.config.lock().unwrap();
     if let Some(item) = config.videos.iter_mut().find(|v| v.id == id) {
         item.local = params;
     }
     state.save(&config).map_err(|e| e.to_string())?;
+    timing!("update_video_params", _t);
     Ok(())
 }

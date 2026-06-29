@@ -40,8 +40,13 @@ interface AppState {
 }
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const start = performance.now();
   const { invoke: tauriInvoke } = await import("@tauri-apps/api/core");
-  return tauriInvoke<T>(cmd, args);
+  try {
+    return await tauriInvoke<T>(cmd, args);
+  } finally {
+    console.log(`[TIMING] invoke ${cmd} ${Math.round(performance.now() - start)}ms`);
+  }
 }
 
 export const useStore = create<AppState>((set, get) => ({
