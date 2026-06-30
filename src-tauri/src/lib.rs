@@ -279,8 +279,15 @@ impl NoiseModel {
                 self.tli_contaminated = false;
                 let bw = self.block_window_ms();
                 self.block_until = Some(Instant::now() + std::time::Duration::from_millis(bw));
-                self.signal_triggered = false;
-                self.consecutive_signal = 0;
+                // Don't reset signal detection if the user is clearly present.
+                // A file transition doesn't mean the user vanished — they're still
+                // interacting. Reset only when idle suggests the user walked away.
+                if idle_ms < VERY_LOW {
+                    self.l(format!("transition skip_signal_reset idle={}ms < VERY_LOW", idle_ms));
+                } else {
+                    self.signal_triggered = false;
+                    self.consecutive_signal = 0;
+                }
                 self.low_idle_count = 0;
                 self.l(format!("transition block={}ms idle={}ms p95={}ms p99={}ms rec_p95={}ms tli={}",
                     bw, idle_ms, self.noise_drops.p95(), self.noise_drops.p99(),
@@ -495,6 +502,26 @@ fn is_idle_monitor_active() -> bool {
 #[tauri::command]
 fn is_playing() -> bool {
     IS_PLAYING.load(Ordering::SeqCst)
+}
+
+#[tauri::command]
+fn toggle_idle_monitor(app: AppHandle) {
+    let state = app.state::<ConfigState>();
+    let mut config = state.config.lock().unwrap();
+    config.global.idle_enabled = !config.global.idle_enabled;
+    let enabled = config.global.idle_enabled;
+    let _ = state.save(&config);
+    drop(config);
+
+    if enabled {
+        start_idle_monitor(app);
+    } else {
+        stop_idle_monitor();
+        if IS_PLAYING.load(std::sync::atomic::Ordering::SeqCst) {
+            IS_PLAYING.store(false, std::sync::atomic::Ordering::SeqCst);
+            stop_playback(&app);
+        }
+    }
 }
 
 fn idle_monitor_loop(app: AppHandle, gen: u64) {
@@ -731,6 +758,7 @@ pub fn run() {
             stop_idle_monitor,
             is_idle_monitor_active,
             is_playing,
+            toggle_idle_monitor,
             manual_play,
             manual_stop,
             thumbnail::get_thumbnail_path,

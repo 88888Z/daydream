@@ -156,15 +156,14 @@ impl MpvPlayer {
                                     .unwrap_or_default()
                                     .as_millis();
 
-                                // Log every transition event with timing
+                                // Log every event with full context
+                                let raw_eid = obj.get("playlist_entry_id").and_then(|e| e.as_u64());
                                 if event_name == "end-file"
                                     || event_name == "start-file"
                                     || event_name == "playback-restart"
                                 {
-                                    let eid = obj.get("playlist_entry_id")
-                                        .and_then(|e| e.as_u64()).unwrap_or(0);
-                                    eprintln!("[MPV] event={} t={}ms entry={}",
-                                        event_name, now_ms, eid);
+                                    eprintln!("[MPV] event={} t={}ms raw_entry={:?}",
+                                        event_name, now_ms, raw_eid);
                                 }
 
                                 // === end-file: transition is starting (next file will load) ===
@@ -176,33 +175,48 @@ impl MpvPlayer {
 
                                 // === start-file: carries playlist_entry_id, store UUID immediately ===
                                 if event_name == "start-file" {
-                                    last_entry_id = obj.get("playlist_entry_id")
-                                        .and_then(|e| e.as_u64());
+                                    last_entry_id = raw_eid;
+                                    eprintln!("[TRACE] start-file last_entry_id={:?} entry_to_item.len={} total_items={}",
+                                        last_entry_id, entry_to_item.len(), total_items);
                                     if let Some(eid) = last_entry_id {
                                         let idx = (eid as usize).saturating_sub(1);
-                                        if let Some(&item_idx) = entry_to_item.get(idx) {
-                                            if let Some(video) = items.get(item_idx) {
+                                        let got = entry_to_item.get(idx);
+                                        eprintln!("[TRACE] start-file eid={} idx={} got={:?}",
+                                            eid, idx, got);
+                                        if let Some(&item_idx) = got {
+                                            let video = items.get(item_idx);
+                                            eprintln!("[TRACE] start-file item_idx={} video={:?}",
+                                                item_idx, video.as_ref().map(|v| &v.filename));
+                                            if let Some(video) = video {
                                                 *crate::LAST_PLAYED_UUID.lock().unwrap() = Some(video.id.clone());
+                                                eprintln!("[TRACE] start-file SET LAST_PLAYED_UUID={}", video.id);
                                             }
                                             let _ = app.emit("now-playing", serde_json::json!({
                                                 "itemIndex": item_idx,
                                                 "entryIndex": idx,
                                                 "totalEntries": total_items,
                                             }));
+                                        } else {
+                                            eprintln!("[TRACE] start-file MISS idx={} >= entry_to_item.len={}",
+                                                idx, entry_to_item.len());
                                         }
+                                    } else {
+                                        eprintln!("[TRACE] start-file raw_eid was None");
                                     }
                                 }
 
-                                // === playback-restart: set transition flag, measure startup, apply speed/volume ===
+                                // === playback-restart: measure startup, apply speed/volume ===
+                                // Note: MPV_JUST_TRANSITIONED is NOT set here — mpv fires 2-5
+                                // playback-restart events per file on this system, each one resetting
+                                // the noise model's signal detection. Only end-file is a reliable
+                                // transition signal (fires exactly once per file transition).
                                 if event_name == "playback-restart" {
-                                    crate::MPV_JUST_TRANSITIONED.store(
-                                        true, std::sync::atomic::Ordering::SeqCst,
-                                    );
+                                    let now_ms_i64 = now_ms as i64;
                                     crate::LAST_MPV_TRANSITION_MS.store(
-                                        now_ms as i64, std::sync::atomic::Ordering::SeqCst,
+                                        now_ms_i64, std::sync::atomic::Ordering::SeqCst,
                                     );
                                     crate::LAST_TRANSITION_AT.store(
-                                        now_ms as i64, std::sync::atomic::Ordering::Release,
+                                        now_ms_i64, std::sync::atomic::Ordering::Release,
                                     );
 
                                     // Measure mpv startup delay
@@ -218,26 +232,41 @@ impl MpvPlayer {
                                         }
                                     }
 
-                                    let eid = last_entry_id.unwrap_or(1);
-                                    let idx = (eid as usize).saturating_sub(1);
+                                    // When last_entry_id is None, this is the initial playback-restart
+                                    // before any start-file event was processed. start_with_monitor
+                                    // already set LAST_PLAYED_UUID and applied speed/volume for the
+                                    // correct video, so skip to avoid overwriting with idx=0.
+                                    if let Some(eid) = last_entry_id {
+                                        let idx = (eid as usize).saturating_sub(1);
+                                        eprintln!("[TRACE] playback-restart last_entry_id={:?} eid={} idx={} entry_to_item.len={}",
+                                            last_entry_id, eid, idx, entry_to_item.len());
 
-                                    // Apply speed/volume for the current video, store UUID
-                                    if let Some(&item_idx) = entry_to_item.get(idx) {
-                                        if let Some(video) = items.get(item_idx) {
-                                            *crate::LAST_PLAYED_UUID.lock().unwrap() = Some(video.id.clone());
-                                            let params = video.local.as_ref().unwrap_or(&global);
-                                            let _ = Self::send_cmd(&serde_json::json!(
-                                                {"command": ["set_property", "speed", params.speed]}
-                                            ));
-                                            let _ = Self::send_cmd(&serde_json::json!(
-                                                {"command": ["set_property", "volume", params.volume]}
-                                            ));
+                                        if let Some(&item_idx) = entry_to_item.get(idx) {
+                                            let video = items.get(item_idx);
+                                            eprintln!("[TRACE] playback-restart item_idx={} video={:?}",
+                                                item_idx, video.as_ref().map(|v| &v.filename));
+                                            if let Some(video) = video {
+                                                *crate::LAST_PLAYED_UUID.lock().unwrap() = Some(video.id.clone());
+                                                eprintln!("[TRACE] playback-restart SET LAST_PLAYED_UUID={}", video.id);
+                                                let params = video.local.as_ref().unwrap_or(&global);
+                                                let _ = Self::send_cmd(&serde_json::json!(
+                                                    {"command": ["set_property", "speed", params.speed]}
+                                                ));
+                                                let _ = Self::send_cmd(&serde_json::json!(
+                                                    {"command": ["set_property", "volume", params.volume]}
+                                                ));
+                                            }
+                                            let _ = app.emit("now-playing", serde_json::json!({
+                                                "itemIndex": item_idx,
+                                                "entryIndex": idx,
+                                                "totalEntries": total_items,
+                                            }));
+                                        } else {
+                                            eprintln!("[TRACE] playback-restart MISS idx={} >= entry_to_item.len={}",
+                                                idx, entry_to_item.len());
                                         }
-                                        let _ = app.emit("now-playing", serde_json::json!({
-                                            "itemIndex": item_idx,
-                                            "entryIndex": idx,
-                                            "totalEntries": total_items,
-                                        }));
+                                    } else {
+                                        eprintln!("[TRACE] playback-restart skipped (last_entry_id=None, keeping initial LAST_PLAYED_UUID)");
                                     }
                                 }
                             }
@@ -289,20 +318,31 @@ impl MpvPlayer {
 
         let baseline_item = rotate_to.unwrap_or(0);
         let baseline_entry = rotate_to_entry.unwrap_or(0);
+
+        // Set LAST_PLAYED_UUID immediately so the first playback-restart
+        // (which has last_entry_id=None and defaults to eid=1 idx=0) doesn't
+        // overwrite it with the wrong video.
+        if let Some(video) = items.get(baseline_item) {
+            *crate::LAST_PLAYED_UUID.lock().unwrap() = Some(video.id.clone());
+            let params = video.local.as_ref().unwrap_or(global);
+            // Retry send_cmd until mpv creates the IPC socket (usually ~200ms).
+            // Otherwise the initial speed/volume is silently lost.
+            let speed_cmd = serde_json::json!({"command": ["set_property", "speed", params.speed]});
+            let vol_cmd = serde_json::json!({"command": ["set_property", "volume", params.volume]});
+            for _ in 0..50 {
+                if Self::send_cmd(&speed_cmd).is_ok() {
+                    let _ = Self::send_cmd(&vol_cmd);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
         let _ = app.emit("now-playing", serde_json::json!({
             "itemIndex": baseline_item,
             "entryIndex": baseline_entry,
             "totalEntries": total_items,
         }));
-        if let Some(first) = items.first() {
-            let params = first.local.as_ref().unwrap_or(global);
-            let _ = Self::send_cmd(&serde_json::json!(
-                {"command": ["set_property", "speed", params.speed]}
-            ));
-            let _ = Self::send_cmd(&serde_json::json!(
-                {"command": ["set_property", "volume", params.volume]}
-            ));
-        }
 
         let child_for_monitor = self.child.lock().unwrap().take();
         let app_clone = app.clone();
@@ -318,7 +358,7 @@ impl MpvPlayer {
                     natural_exit = false;
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(50));
                 match c.try_wait() {
                     Ok(Some(_)) => {
                         let _ = c.wait();
@@ -371,10 +411,10 @@ impl MpvPlayer {
         if let Some(signal) = self.stop_signal.lock().unwrap().take() {
             signal.store(true, Ordering::SeqCst);
         }
-        if let Some(mut child) = self.child.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        // Don't kill child directly — the monitor thread owns it.
+        // Setting the stop signal is enough; the monitor thread will kill it on its
+        // next poll (50ms). Directly killing mpv with SIGKILL can leave GPU state
+        // dirty, causing the next mpv instance to hang during init.
         let _ = std::fs::remove_file(PathBuf::from(MPV_SOCKET));
         eprintln!("[TIMING] mpv_stop {}us", _t.elapsed().as_micros());
     }

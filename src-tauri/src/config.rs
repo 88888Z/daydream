@@ -142,7 +142,12 @@ pub fn update_global_settings(
     settings: GlobalSettings,
 ) -> Result<(), String> {
     let mut config = state.config.lock().unwrap();
+    // Preserve last_played_id — only the backend (stop_playback) should update this.
+    // The frontend may send stale last_played_id when toggling settings, which would
+    // undo a save that stop_playback just made.
+    let last_played = config.global.last_played_id.clone();
     config.global = settings;
+    config.global.last_played_id = last_played;
     state.save(&config).map_err(|e| e.to_string())?;
     Ok(())
 }

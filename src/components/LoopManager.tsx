@@ -38,7 +38,6 @@ export default function LoopManager() {
   const stop = useStore((s) => s.stop);
   const config = useStore((s) => s.config);
   const idleRemaining = useStore((s) => s.idleRemaining);
-  const updateGlobalSettings = useStore((s) => s.updateGlobalSettings);
   const selectedIds = useStore((s) => s.selectedIds);
   const selectAll = useStore((s) => s.selectAll);
   const clearSelection = useStore((s) => s.clearSelection);
@@ -107,15 +106,11 @@ export default function LoopManager() {
 
   const toggleIdle = useCallback(async () => {
     const newEnabled = !idleEnabled;
-    await updateGlobalSettings({ ...config.global, idle_enabled: newEnabled });
-
-    if (newEnabled) {
-      await invoke("start_idle_monitor");
-    } else {
-      await invoke("stop_idle_monitor");
-      if (isPlaying) stop();
-    }
-  }, [config.global, idleEnabled, updateGlobalSettings, isPlaying, stop]);
+    useStore.setState((s) => ({
+      config: { ...s.config, global: { ...s.config.global, idle_enabled: newEnabled } }
+    }));
+    await invoke("toggle_idle_monitor");
+  }, [idleEnabled]);
 
   useEffect(() => {
     if (idleEnabled) {
